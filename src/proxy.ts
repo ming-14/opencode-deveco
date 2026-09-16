@@ -121,6 +121,40 @@ export class ConcurrencyGate {
 }
 
 /**
+ * Abort the current turn as soon as the client hangs up. Without this the
+ * upstream keeps generating into a socket nobody reads — 30s+ of wasted work,
+ * a leased DevEco queue slot, and (with the concurrency gate) every later
+ * request queued behind it. Listeners live on the per-request `res`, so they
+ * are collected with it.
+ */
+export function abortOnClientClose(res: http.ServerResponse): AbortController {
+  const controller = new AbortController()
+  res.on("close", () => {
+    // `close` also fires after a normal finish; only a premature one matters.
+    if (res.writableFinished || controller.signal.aborted) return
+    log.debug("proxy: client disconnected, aborting upstream turn")
+    controller.abort(new Error("client disconnected"))
+  })
+  return controller
+}
+
+/**
+ * Write to a client that may already be gone. A throw here would surface as an
+ * unhandled rejection (the caller is usually a `catch` handler), so failures
+ * are logged and reported instead.
+ */
+function safeWrite(res: http.ServerResponse, chunk: string | Uint8Array): boolean {
+  try {
+    if (res.writableEnded || res.destroyed) return false
+    res.write(chunk)
+    return true
+  } catch (err) {
+    log.debug("proxy: write to a gone client failed", { error: String(err) })
+    return false
+  }
+}
+
+/**
  * A stable per-conversation key.
  *
  * Neither the Anthropic nor the OpenAI wire format carries a session id, but a
@@ -222,6 +256,10 @@ export class DevEcoProxy {
     // the whole point of this proxy is to keep the client connected across
     // upstream failures.
     this.server = http.createServer((req, res) => {
+      // A client that walks away turns later writes into socket errors; an
+      // 'error' event with no listener is fatal, so every socket is guarded.
+      req.on("error", (err: Error) => log.debug("proxy: request socket error", { error: String(err) }))
+      res.on("error", (err: Error) => log.debug("proxy: response socket error", { error: String(err) }))
       this.handle(req, res).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err)
         log.error("proxy request failed", { error: msg })
@@ -383,6 +421,11 @@ export class DevEcoProxy {
           } else {
             log.warn("DevEco login did not complete", { error: r.error })
           }
+        })
+        .catch((err) => {
+          // A rejected login promise used to escape as an unhandled rejection
+          // and kill the proxy process.
+          log.warn("DevEco login flow failed", { error: String(err) })
         })
         .finally(() => {
           this.pendingLogin = null
@@ -657,6 +700,10 @@ export class DevEcoProxy {
     )
 
     const budget = idleBudget(UPSTREAM_IDLE_TIMEOUT_MS)
+    // End the turn as soon as the client is gone, rather than draining the
+    // upstream into a dead socket (and holding the concurrency slot).
+    const clientGone = abortOnClientClose(res)
+    const signal = AbortSignal.any([budget.signal, clientGone.signal])
 
     // Forward to DevEco and stream/passthrough the response back. The queue
     // slot must be released on EVERY path that reached upstream, including
@@ -666,7 +713,7 @@ export class DevEcoProxy {
         method: "POST",
         headers,
         body: bodyInit,
-        signal: budget.signal,
+        signal,
       }).catch((err) => {
         throw new Error(`upstream fetch failed: ${String(err)}`)
       })
@@ -689,13 +736,13 @@ export class DevEcoProxy {
               method: "POST",
               headers,
               body: bodyInit,
-              signal: budget.signal,
+              signal,
             })
           }
         }
       }
 
-      await this.pipeResponse(responseToPipe, res, stream, ctx, budget.touch)
+      await this.pipeResponse(responseToPipe, res, stream, { ...ctx, clientGone: signal }, budget.touch)
     } finally {
       budget.done()
       this.exitQueue(convKey, chatId, upstreamModel, accessToken)
@@ -775,6 +822,9 @@ export class DevEcoProxy {
     )
 
     const budget = idleBudget(UPSTREAM_IDLE_TIMEOUT_MS)
+    // Same as the OpenAI path: a client that hangs up ends the turn here.
+    const clientGone = abortOnClientClose(res)
+    const signal = AbortSignal.any([budget.signal, clientGone.signal])
     const finishTurn = () => {
       budget.done()
       this.exitQueue(convKey, chatId, upstreamModel, accessToken)
@@ -787,7 +837,7 @@ export class DevEcoProxy {
         method: "POST",
         headers,
         body: openaiBody,
-        signal: budget.signal,
+        signal,
       })
 
       // 401 retry — kept inside the same try so a retry fetch failure still
@@ -808,7 +858,7 @@ export class DevEcoProxy {
               method: "POST",
               headers,
               body: openaiBody,
-              signal: budget.signal,
+              signal,
             })
           }
         }
@@ -817,32 +867,29 @@ export class DevEcoProxy {
       finishTurn()
       const msg = err instanceof Error ? err.message : String(err)
       log.error("anthropic upstream fetch failed", { error: msg })
-      res.writeHead(502, { "Content-Type": "application/json" })
-      return void res.end(JSON.stringify({
+      return this.json(res, 502, {
         type: "error",
         error: { type: "api_error", message: msg },
-      }))
+      })
     }
 
     if (!upstream.ok) {
       finishTurn()
       const errText = await upstream.text().catch(() => "")
       log.error(`anthropic upstream error: HTTP ${upstream.status}`, { body: errText.slice(0, 200) })
-      res.writeHead(upstream.status, { "Content-Type": "application/json" })
-      return void res.end(JSON.stringify({
+      return this.json(res, upstream.status, {
         type: "error",
         error: { type: "api_error", message: `Upstream returned HTTP ${upstream.status}: ${errText.slice(0, 500)}` },
-      }))
+      })
     }
 
     if (isStream) {
       if (!upstream.body) {
         finishTurn()
-        res.writeHead(502, { "Content-Type": "application/json" })
-        return void res.end(JSON.stringify({
+        return this.json(res, 502, {
           type: "error",
           error: { type: "api_error", message: "Upstream returned no body for stream" },
-        }))
+        })
       }
 
       const anthropicStream = openaiChatStreamToAnthropic(upstream.body, model, budget.touch)
@@ -854,21 +901,24 @@ export class DevEcoProxy {
 
       const reader = anthropicStream.getReader()
       const pump = async () => {
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          res.write(value)
+        try {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            // A failed write means the client is gone: stop pulling upstream.
+            if (!safeWrite(res, value)) break
+          }
+        } finally {
+          // Whatever ended the loop, never leave the upstream pipe open.
+          await reader.cancel().catch(() => {})
+          res.end()
         }
-        res.end()
         const dur = Date.now() - t0
         log.info(`<- 200 ${dur}ms anthropic/stream model=${model}`)
       }
       void pump()
         .catch((err) => {
           log.error("anthropic stream pipe error", { error: String(err) })
-          // The client went away: stop draining the upstream into a dead pipe.
-          reader.cancel().catch(() => {})
-          res.end()
         })
         .finally(finishTurn)
       return
@@ -891,7 +941,7 @@ export class DevEcoProxy {
     upstream: Response,
     res: http.ServerResponse,
     stream: boolean,
-    ctx?: { model: string; stream: boolean; upstreamUrl: string; t0: number },
+    ctx?: { model: string; stream: boolean; upstreamUrl: string; t0: number; clientGone?: AbortSignal },
     touch?: () => void,
   ): Promise<void> {
     const respHeaders: Record<string, string> = {
@@ -927,7 +977,14 @@ export class DevEcoProxy {
         // error status — swallowing it here also keeps the throw from reaching
         // handle()'s catch, which would try to write headers a second time and
         // take the whole process down with an unhandled rejection.
-        log.error("upstream stream ended early", { error: String(err) })
+        const msg = err instanceof Error ? err.message : String(err)
+        // A client that hung up is routine (the editor's stop button), so it
+        // does not deserve an error line; an upstream that dies on its own does.
+        if (ctx?.clientGone?.aborted || res.destroyed) {
+          log.debug("proxy: upstream stopped with the client gone", { error: msg })
+        } else {
+          log.error("upstream stream ended early", { error: msg })
+        }
         // Stop draining the upstream: the client is gone or the stream died,
         // and leaving the reader active would leak the backend connection.
         await reader.cancel().catch(() => {})
@@ -935,10 +992,7 @@ export class DevEcoProxy {
         // silently truncated stream. (The Anthropic transform already emits an
         // `event: error` on its own path.)
         if (stream) {
-          const msg = err instanceof Error ? err.message : String(err)
-          res.write(
-            `data: ${JSON.stringify({ error: { message: msg, type: "api_error" } })}\n\n`,
-          )
+          safeWrite(res, `data: ${JSON.stringify({ error: { message: msg, type: "api_error" } })}\n\n`)
         }
       }
     }
@@ -1010,13 +1064,21 @@ export class DevEcoProxy {
 
   private json(res: http.ServerResponse, status: number, body: unknown): void {
     // Once the head is out (a stream that failed midway) writing it again
-    // throws ERR_HTTP_HEADERS_SENT; all we can still do is close the response.
-    if (res.headersSent) {
-      res.end()
-      return
+    // throws ERR_HTTP_HEADERS_SENT, and a client that already went away makes
+    // the write itself throw — all that is left is to try to close the response.
+    try {
+      if (res.headersSent || res.writableEnded) {
+        res.end()
+        return
+      }
+      res.writeHead(status, { "Content-Type": "application/json" })
+      res.end(JSON.stringify(body))
+    } catch (err) {
+      log.debug("proxy: could not answer (client already gone?)", {
+        status,
+        error: String(err),
+      })
     }
-    res.writeHead(status, { "Content-Type": "application/json" })
-    res.end(JSON.stringify(body))
   }
 }
 
@@ -1067,6 +1129,17 @@ if (isDirectRun) {
   }
   process.on("SIGTERM", shutdown)
   process.on("SIGINT", shutdown)
+
+  // A proxy that dies takes every client with it, so an unexpected throw or a
+  // stray rejected promise is logged and survived instead of being fatal. Both
+  // handlers exist only here: the plugin path runs inside opencode, whose own
+  // error handling must not be hijacked.
+  process.on("uncaughtException", (err) => {
+    log.error("uncaught exception (proxy keeps running)", { error: String(err) })
+  })
+  process.on("unhandledRejection", (reason) => {
+    log.error("unhandled rejection (proxy keeps running)", { error: String(reason) })
+  })
 
   runProxy({ port })
     .then((p) => {

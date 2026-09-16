@@ -512,4 +512,97 @@ describe("DevEcoProxy integration", () => {
       delete process.env.DEVECO_MAX_CONCURRENCY
     }
   })
+
+  it("aborts the upstream turn and frees the slot when the client disconnects", async () => {
+    const fresh = makeJwt({ userId: "u1", userName: "New", exp: Math.floor(Date.now() / 1000) + 3600 })
+    await new JsonTokenStore().save(fresh)
+
+    let upstreamCancelled = false
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes("127.0.0.1")) return originalFetch(input, init)
+      if (url.includes("jwToken/check") || url.includes("exitSessionQueue")) {
+        return mockUpstreamFetch(input, init)
+      }
+      // The proxy forwards the client body as a Buffer (or a string on some
+      // paths), so look at the bytes rather than assuming a type.
+      const rawBody = init?.body
+      const bodyText =
+        typeof rawBody === "string"
+          ? rawBody
+          : rawBody instanceof Uint8Array
+            ? Buffer.from(rawBody).toString("utf8")
+            : ""
+      if (bodyText.includes('"stream":true')) {
+        // A stream that never ends on its own; a real fetch would tear the
+        // upstream connection down when the signal aborts, so model that here.
+        const encoder = new TextEncoder()
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'))
+            init?.signal?.addEventListener("abort", () => {
+              upstreamCancelled = true
+              controller.error(new Error("aborted"))
+            })
+          },
+          pull: () => new Promise((r) => setTimeout(r, 50)),
+          cancel: () => {
+            upstreamCancelled = true
+          },
+        })
+        return new Response(stream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        })
+      }
+      return new Response(
+        JSON.stringify({
+          id: "chatcmpl-quick",
+          object: "chat.completion",
+          model: "GLM-5.1",
+          choices: [
+            { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    const p = await startProxy()
+    const chatUrl = `http://127.0.0.1:${p.getPort()}/v2/chat/completions`
+    const payload = (stream: boolean) =>
+      JSON.stringify({
+        model: "GLM-5.1",
+        messages: [{ role: "user", content: "hi" }],
+        ...(stream ? { stream: true } : {}),
+      })
+
+    const ac = new AbortController()
+    const res = await fetch(chatUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload(true),
+      signal: ac.signal,
+    })
+    const reader = res.body!.getReader()
+    await reader.read()
+
+    // The client walks away mid-stream.
+    await reader.cancel().catch(() => {})
+    ac.abort()
+
+    // The proxy must notice and stop draining the upstream...
+    await vi.waitFor(() => expect(upstreamCancelled).toBe(true), { timeout: 2000 })
+
+    // ...and release the concurrency slot: the next request is served at once.
+    const started = Date.now()
+    const second = await fetch(chatUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload(false),
+    })
+    expect(second.status).toBe(200)
+    expect(Date.now() - started).toBeLessThan(1000)
+  })
 })
