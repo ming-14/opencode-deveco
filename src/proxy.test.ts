@@ -605,4 +605,100 @@ describe("DevEcoProxy integration", () => {
     expect(second.status).toBe(200)
     expect(Date.now() - started).toBeLessThan(1000)
   })
+
+  /**
+   * A client that hangs up while its request is still queued must not start an
+   * upstream turn once the slot frees: `close` fired before the turn began, so
+   * the turn has to be skipped instead of streaming into a dead socket.
+   */
+  const queuedDisconnectSkipsTurn = async (endpoint: string, payload: string): Promise<void> => {
+    const fresh = makeJwt({ userId: "u1", userName: "New", exp: Math.floor(Date.now() / 1000) + 3600 })
+    await new JsonTokenStore().save(fresh)
+
+    // Held until the test has let the queued request be abandoned.
+    let releaseFirstTurn!: () => void
+    const firstTurnHeld = new Promise<void>((resolve) => {
+      releaseFirstTurn = resolve
+    })
+
+    let upstreamTurns = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes("127.0.0.1")) return originalFetch(input, init)
+      if (url.includes("jwToken/check") || url.includes("exitSessionQueue")) {
+        return mockUpstreamFetch(input, init)
+      }
+      upstreamTurns++
+      // The first turn occupies the only slot until the test releases it.
+      if (upstreamTurns === 1) await firstTurnHeld
+      return new Response(
+        JSON.stringify({
+          id: "chatcmpl-queued",
+          object: "chat.completion",
+          model: "GLM-5.1",
+          choices: [
+            { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    const p = await startProxy()
+    const url = `http://127.0.0.1:${p.getPort()}${endpoint}`
+    const post = (signal?: AbortSignal) =>
+      fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: payload,
+        signal,
+      })
+
+    const debugSpy = vi.spyOn(log, "debug")
+    const logged = (needle: string) =>
+      debugSpy.mock.calls.some((args) =>
+        args.some((a) => typeof a === "string" && a.includes(needle)),
+      )
+
+    const first = post()
+    await vi.waitFor(() => expect(upstreamTurns).toBe(1), { timeout: 2000 })
+
+    // The second request queues behind the first, then its client walks away.
+    const ac = new AbortController()
+    void post(ac.signal).catch(() => {
+      /* the abort rejects client-side; expected */
+    })
+    await vi.waitFor(() => expect(logged("proxy: queued")).toBe(true), { timeout: 2000 })
+    ac.abort()
+    // Wait until the hang-up actually reached the server before freeing the
+    // slot: that the skipped turn was still queued when the abort landed is
+    // exactly the case under test. (Releasing first would race the socket
+    // close through the event loop and sometimes admit the turn too early.)
+    await vi.waitFor(() => expect(logged("client disconnected")).toBe(true), { timeout: 2000 })
+
+    releaseFirstTurn()
+    expect((await first).status).toBe(200)
+
+    // Only the first turn ever reached upstream, and the slot was handed on:
+    // the next request is served immediately.
+    const started = Date.now()
+    expect((await post()).status).toBe(200)
+    expect(Date.now() - started).toBeLessThan(1000)
+    expect(upstreamTurns).toBe(2)
+  }
+
+  it("skips the upstream turn when a queued chat client disconnects", async () => {
+    await queuedDisconnectSkipsTurn(
+      "/v2/chat/completions",
+      JSON.stringify({ model: "GLM-5.1", messages: [{ role: "user", content: "hi" }] }),
+    )
+  })
+
+  it("skips the upstream turn when a queued anthropic client disconnects", async () => {
+    await queuedDisconnectSkipsTurn(
+      "/v2/anthropic/v1/messages",
+      JSON.stringify({ model: "GLM-5.1", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+    )
+  })
 })

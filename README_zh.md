@@ -347,7 +347,7 @@ Claude Code 长会话跑几轮就报错的问题，以及登录相关的修复�
 - **`max_tokens` 会被遵守** — Anthropic 路径上原本静默丢弃了这个字段。
 - **Chat-Id 按对话保持稳定** —— 会话 key 锚定对话的**第一条用户消息**（不是 `messages[0]`——OpenAI 线格式里那是 system 提示词），因此即使 system 提示词每轮变化（当前时间、工作目录等易变内容）也不会每轮新建 DevEco 会话、触发上游限流。客户端可用 `x-session-id` / `x-deveco-session` / `x-session-affinity` 显式固定会话，或用 `DEVECO_SESSION_KEY_MODE=system-first` 改为按 system 区分会话（OpenAI 的 system 消息与 Anthropic 的顶层 `system` 字段都识别）。每轮结束时通过 `exitSessionQueue` 释放队列槽位。
 - **`logged_in` 如实上报** —— `/v2/status` 只要凭证存在且可静默刷新就返回 `logged_in:true`，而不是只在当前 access token 未过期时（它每 30 分钟过期一次）。
-- **断连即释放上游** —— 客户端断开 SSE/HTTP 连接会取消上游读取循环，不再把后端连接抽进死管道；优雅关停也不再被长连接卡死（5 秒宽限后强制关闭）。
+- **断连即释放上游** —— 客户端断开 SSE/HTTP 连接会取消上游读取循环，不再把后端连接抽进死管道；排队等待期间就离开的客户端不会再启动上游轮次；优雅关停也不再被长连接卡死（5 秒宽限后强制关闭）。
 - **请求体限 128 MB**，且 `/chat/completions` 仅接受 POST。
 - **登录不再阻塞** — `/v2/login` 立即返回重定向；未登录时发请求会快速失败并附上登录 URL，而不是一直挂着。
 - **优雅关停**、**模型列表每小时刷新**、**HTTP 统一走 `fetch`**（自定义 `HttpClient` 已删除）、**lint 与测试**，以及所有端点的 `/v2` 前缀均可省略。

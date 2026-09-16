@@ -565,8 +565,15 @@ export class DevEcoProxy {
       if (p === "/models") {
         // Listing models must not pop a browser: use the current session when
         // available and fall back to the static defaults when logged out.
+        // Same guard as the turn paths: a client that left while queued should
+        // not cost an upstream call.
+        const clientGone = abortOnClientClose(res)
         await this.gate.acquire("models")
         try {
+          if (clientGone.signal.aborted) {
+            log.debug("proxy: client gone while queued, skipping model list")
+            return
+          }
           const token = await this.ensureToken(false)
           const cfg = await getDevecoProviderConfig(token)
           const data = Object.keys(cfg.models ?? {}).map((id) => ({ id, object: "model" }))
@@ -604,6 +611,12 @@ export class DevEcoProxy {
   ): Promise<void> {
     // Read the full request body.
     const bodyBuffer = await this.readBody(req)
+    // Armed before the token wait and the concurrency queue: `close` is a
+    // one-shot event, so a client that hangs up while this request is still
+    // waiting for a slot would be missed by a listener attached afterwards —
+    // the turn would then run a full generation into a dead socket while
+    // holding the slot.
+    const clientGone = abortOnClientClose(res)
     let stream = true
     let model = "?"
     let convKey = crypto.randomUUID().replace(/-/g, "")
@@ -693,6 +706,13 @@ export class DevEcoProxy {
     // Wait for an upstream slot first: the logged duration then measures the
     // upstream exchange, and the log order matches what the backend saw.
     await this.gate.acquire(`chat ${model}`)
+    if (clientGone.signal.aborted) {
+      // The client left while queued. Nothing reached upstream, so there is no
+      // server-side queue slot to exit — just hand ours to the next waiter.
+      log.debug("proxy: client gone while queued, skipping chat turn", { model })
+      this.gate.release()
+      return
+    }
     const ctx = { model, stream, upstreamUrl, t0: Date.now() }
     log.info(
       `-> POST ${stream ? "stream" : "no-stream"} model=${model}` +
@@ -700,9 +720,6 @@ export class DevEcoProxy {
     )
 
     const budget = idleBudget(UPSTREAM_IDLE_TIMEOUT_MS)
-    // End the turn as soon as the client is gone, rather than draining the
-    // upstream into a dead socket (and holding the concurrency slot).
-    const clientGone = abortOnClientClose(res)
     const signal = AbortSignal.any([budget.signal, clientGone.signal])
 
     // Forward to DevEco and stream/passthrough the response back. The queue
@@ -761,6 +778,9 @@ export class DevEcoProxy {
     res: http.ServerResponse,
   ): Promise<void> {
     const bodyBuffer = await this.readBody(req)
+    // Same as the OpenAI path: armed before the token wait and the queue, so a
+    // client that hangs up while waiting for a slot is not missed.
+    const clientGone = abortOnClientClose(res)
 
     let anthropicReq: AnthropicRequest
     try {
@@ -815,6 +835,13 @@ export class DevEcoProxy {
     // Wait for an upstream slot first: the logged duration then measures the
     // upstream exchange, and the log order matches what the backend saw.
     await this.gate.acquire(`anthropic ${model}`)
+    if (clientGone.signal.aborted) {
+      // Same as the OpenAI path: nothing reached upstream, so there is no
+      // server-side queue slot to exit — hand ours to the next waiter.
+      log.debug("proxy: client gone while queued, skipping anthropic turn", { model })
+      this.gate.release()
+      return
+    }
     const t0 = Date.now()
     log.info(
       `-> POST anthropic/${isStream ? "stream" : "no-stream"} model=${model}` +
@@ -822,8 +849,6 @@ export class DevEcoProxy {
     )
 
     const budget = idleBudget(UPSTREAM_IDLE_TIMEOUT_MS)
-    // Same as the OpenAI path: a client that hangs up ends the turn here.
-    const clientGone = abortOnClientClose(res)
     const signal = AbortSignal.any([budget.signal, clientGone.signal])
     const finishTurn = () => {
       budget.done()

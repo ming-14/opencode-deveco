@@ -391,8 +391,9 @@ behind each.
   access token is unexpired (it expires every 30 minutes).
 - **Client disconnects release the upstream** — a dropped SSE/HTTP client
   cancels the upstream read loop instead of draining the backend connection
-  into a dead pipe; graceful shutdown no longer hangs on long-lived streams
-  (5s grace, then force-close).
+  into a dead pipe, and a client that leaves while its request is still queued
+  starts no upstream turn at all; graceful shutdown no longer hangs on
+  long-lived streams (5s grace, then force-close).
 - **Bounded request bodies** (128 MB) and `POST`-only chat forwarding.
 - **Non-blocking login** — `/v2/login` redirects immediately, and requests made
   while logged out fail fast with the login URL instead of hanging.
