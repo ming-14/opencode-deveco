@@ -5,7 +5,7 @@ import path from "node:path"
 import { browserOpenCommand, parseJwt, parseRealName, userInfoFromJwt } from "./auth-login.js"
 import { ConcurrencyGate, conversationKey, DevEcoProxy, idleBudget, sessionKeyFromHeaders } from "./proxy.js"
 import { JsonTokenStore } from "./token-store.js"
-import { log } from "./config.js"
+import { log, queueCooldownMs } from "./config.js"
 
 // Helper: build a minimal JWT (header.payload.signature) with a given payload.
 function makeJwt(payload: Record<string, unknown>): string {
@@ -165,8 +165,37 @@ describe("idleBudget", () => {
   })
 })
 
+describe("queueCooldownMs", () => {
+  const OLD = process.env.DEVECO_QUEUE_COOLDOWN_SEC
+
+  afterEach(() => {
+    if (OLD === undefined) delete process.env.DEVECO_QUEUE_COOLDOWN_SEC
+    else process.env.DEVECO_QUEUE_COOLDOWN_SEC = OLD
+  })
+
+  it("defaults to one second and lets an explicit zero switch the pause off", () => {
+    delete process.env.DEVECO_QUEUE_COOLDOWN_SEC
+    expect(queueCooldownMs()).toBe(1000)
+    process.env.DEVECO_QUEUE_COOLDOWN_SEC = "0"
+    expect(queueCooldownMs()).toBe(0)
+  })
+
+  it("accepts fractional seconds and ignores unparseable values", () => {
+    process.env.DEVECO_QUEUE_COOLDOWN_SEC = "0.5"
+    expect(queueCooldownMs()).toBe(500)
+    process.env.DEVECO_QUEUE_COOLDOWN_SEC = "abc"
+    expect(queueCooldownMs()).toBe(1000)
+  })
+})
+
 describe("ConcurrencyGate", () => {
   const tick = () => new Promise((r) => setTimeout(r, 0))
+  // Drains pending microtasks only, never timers: an admission that is gated on
+  // the cooldown cannot sneak through, while one that wrongly happened on the
+  // spot (a plain promise resolution) always does. Load-independent either way.
+  const flushMicrotasks = async () => {
+    for (let i = 0; i < 5; i++) await Promise.resolve()
+  }
 
   it("admits up to `limit` holders at once and queues the rest", async () => {
     const gate = new ConcurrencyGate(2)
@@ -220,6 +249,77 @@ describe("ConcurrencyGate", () => {
     }
     await Promise.allSettled([task(), task()])
     expect(peak).toBe(1)
+  })
+
+  // --- queued-request cooldown (DEVECO_QUEUE_COOLDOWN_SEC) -------------------
+
+  it("never cools down a request that finds a free slot", async () => {
+    const gate = new ConcurrencyGate(2, 80)
+    const started = Date.now()
+    await gate.acquire("a")
+    await gate.acquire("b")
+    // Both slots were free, so neither owes the cooldown (nothing but
+    // microtasks happens in between; a >60ms stall would be machine noise, and
+    // an applied cooldown could never fire in under its 80ms).
+    expect(Date.now() - started).toBeLessThan(60)
+    gate.release()
+    gate.release()
+  })
+
+  it("cools down before admitting a queued waiter", async () => {
+    const gate = new ConcurrencyGate(1, 60)
+    await gate.acquire("holder")
+    const admittedAt: number[] = []
+    const waiter = gate.acquire("waiter").then(() => admittedAt.push(Date.now()))
+    await tick()
+    const releasedAt = Date.now()
+    gate.release()
+    // Still cooling down: even after every pending microtask has run, the
+    // waiter cannot have started (its wake-up needs a timer).
+    await flushMicrotasks()
+    expect(admittedAt).toEqual([])
+    await waiter
+    expect(admittedAt[0] - releasedAt).toBeGreaterThanOrEqual(50)
+    gate.release()
+  })
+
+  it("cools down per freed slot when the limit is wider", async () => {
+    const gate = new ConcurrencyGate(2, 60)
+    await gate.acquire("a")
+    await gate.acquire("b")
+    const admittedAt: number[] = []
+    const queued = gate.acquire("queued").then(() => admittedAt.push(Date.now()))
+    await tick()
+    const releasedAt = Date.now()
+    gate.release() // one of the two slots frees up; `b` keeps running
+    // Same as above: microtasks only, so the queued request can't be running.
+    await flushMicrotasks()
+    expect(admittedAt).toEqual([])
+    await queued
+    expect(admittedAt[0] - releasedAt).toBeGreaterThanOrEqual(50)
+    gate.release()
+    gate.release()
+  })
+
+  it("keeps the freed slot reserved so a latecomer can't jump the queue", async () => {
+    const gate = new ConcurrencyGate(1, 40)
+    await gate.acquire("holder")
+    const order: string[] = []
+    const first = gate.acquire("first").then(() => order.push("first"))
+    await tick()
+    gate.release() // the slot already belongs to `first`, which is cooling down
+    const latecomer = gate.acquire("latecomer").then(() => order.push("latecomer"))
+    // If the slot had been freed outright, the latecomer would grab it on the
+    // spot and land in `order` within these microtasks; because it is reserved
+    // for `first` (still cooling down), the latecomer has to queue instead.
+    await flushMicrotasks()
+    expect(order).toEqual([])
+    await first
+    expect(order).toEqual(["first"])
+    gate.release()
+    await latecomer
+    expect(order).toEqual(["first", "latecomer"])
+    gate.release()
   })
 })
 
@@ -386,6 +486,13 @@ describe("DevEcoProxy integration", () => {
     return proxy
   }
 
+  /** Spy on the proxy's debug log and return a predicate over its lines. */
+  const spyOnDebugLog = (): ((needle: string) => boolean) => {
+    const spy = vi.spyOn(log, "debug")
+    return (needle) =>
+      spy.mock.calls.some((args) => args.some((a) => typeof a === "string" && a.includes(needle)))
+  }
+
   it("reports logged_in:true when only an expired jwtToken exists (silent refresh possible)", async () => {
     // An already-expired JWT: tryRestoreSession's refresh short-circuits
     // without a network call, leaving no live session.
@@ -491,6 +598,9 @@ describe("DevEcoProxy integration", () => {
       })
 
     try {
+      // This test measures the concurrency width itself; the (default-on)
+      // queue cooldown would only add dead time here.
+      process.env.DEVECO_QUEUE_COOLDOWN_SEC = "0"
       // Default: one upstream request at a time, the rest queue.
       delete process.env.DEVECO_MAX_CONCURRENCY
       const serial = await startProxy()
@@ -510,6 +620,7 @@ describe("DevEcoProxy integration", () => {
       expect(peak).toBe(2)
     } finally {
       delete process.env.DEVECO_MAX_CONCURRENCY
+      delete process.env.DEVECO_QUEUE_COOLDOWN_SEC
     }
   })
 
@@ -569,7 +680,11 @@ describe("DevEcoProxy integration", () => {
       )
     }) as typeof fetch
 
+    // Slot release is what's under test here, not the cooldown: keep the
+    // (default-on) pause out of the timing below.
+    process.env.DEVECO_QUEUE_COOLDOWN_SEC = "0"
     const p = await startProxy()
+    delete process.env.DEVECO_QUEUE_COOLDOWN_SEC
     const chatUrl = `http://127.0.0.1:${p.getPort()}/v2/chat/completions`
     const payload = (stream: boolean) =>
       JSON.stringify({
@@ -645,7 +760,12 @@ describe("DevEcoProxy integration", () => {
       )
     }) as typeof fetch
 
+    // This test is about the disconnect path, not the cooldown: disable the
+    // (default-on) pause so the slot handover stays immediate. The gate reads
+    // the env at construction, so it can be cleared again right away.
+    process.env.DEVECO_QUEUE_COOLDOWN_SEC = "0"
     const p = await startProxy()
+    delete process.env.DEVECO_QUEUE_COOLDOWN_SEC
     const url = `http://127.0.0.1:${p.getPort()}${endpoint}`
     const post = (signal?: AbortSignal) =>
       fetch(url, {
@@ -655,11 +775,7 @@ describe("DevEcoProxy integration", () => {
         signal,
       })
 
-    const debugSpy = vi.spyOn(log, "debug")
-    const logged = (needle: string) =>
-      debugSpy.mock.calls.some((args) =>
-        args.some((a) => typeof a === "string" && a.includes(needle)),
-      )
+    const logged = spyOnDebugLog()
 
     const first = post()
     await vi.waitFor(() => expect(upstreamTurns).toBe(1), { timeout: 2000 })
@@ -700,5 +816,73 @@ describe("DevEcoProxy integration", () => {
       "/v2/anthropic/v1/messages",
       JSON.stringify({ model: "GLM-5.1", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
     )
+  })
+
+  it("cools down before admitting a queued turn when DEVECO_QUEUE_COOLDOWN_SEC is set", async () => {
+    const fresh = makeJwt({ userId: "u1", userName: "New", exp: Math.floor(Date.now() / 1000) + 3600 })
+    await new JsonTokenStore().save(fresh)
+
+    let releaseFirstTurn!: () => void
+    const firstTurnHeld = new Promise<void>((resolve) => {
+      releaseFirstTurn = resolve
+    })
+    const upstreamStarts: number[] = []
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes("127.0.0.1")) return originalFetch(input, init)
+      if (url.includes("jwToken/check") || url.includes("exitSessionQueue")) {
+        return mockUpstreamFetch(input, init)
+      }
+      upstreamStarts.push(Date.now())
+      if (upstreamStarts.length === 1) await firstTurnHeld
+      return new Response(
+        JSON.stringify({
+          id: "chatcmpl-cooldown",
+          object: "chat.completion",
+          model: "GLM-5.1",
+          choices: [
+            { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    process.env.DEVECO_QUEUE_COOLDOWN_SEC = "0.4"
+    try {
+      const p = await startProxy()
+      const logged = spyOnDebugLog()
+      const chatUrl = `http://127.0.0.1:${p.getPort()}/v2/chat/completions`
+      const post = () =>
+        fetch(chatUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "GLM-5.1", messages: [{ role: "user", content: "hi" }] }),
+        })
+
+      const first = post()
+      await vi.waitFor(() => expect(upstreamStarts.length).toBe(1), { timeout: 2000 })
+
+      // The second turn has to queue, so it owes the cooldown.
+      const second = post()
+      await vi.waitFor(() => expect(logged("proxy: queued")).toBe(true), { timeout: 2000 })
+
+      releaseFirstTurn()
+      const firstRes = await first
+      await firstRes.text()
+      const slotFreedAt = Date.now()
+      expect((await second).status).toBe(200)
+
+      // Only the two turns reached upstream, and the queued one started only
+      // after the 400ms cooldown. `slotFreedAt` is read client-side, so the
+      // bound sits below the cooldown (absorbing that skew) while staying far
+      // above the ~0ms a missing cooldown would show.
+      expect(upstreamStarts).toHaveLength(2)
+      expect(upstreamStarts[1] - slotFreedAt).toBeGreaterThanOrEqual(250)
+    } finally {
+      delete process.env.DEVECO_QUEUE_COOLDOWN_SEC
+    }
   })
 })

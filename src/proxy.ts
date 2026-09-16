@@ -27,6 +27,7 @@ import {
   UPSTREAM_IDLE_TIMEOUT_MS,
   log,
   maxConcurrency,
+  queueCooldownMs,
 } from "./config.js"
 import { createLoginService, userInfoFromJwt, type RefreshResult, type UserInfo } from "./auth-login.js"
 import { JsonTokenStore } from "./token-store.js"
@@ -93,14 +94,21 @@ export function idleBudget(idleMs: number): {
  * throttles bursts per account, so a burst degrades into a queue instead of a
  * failure; waiters are admitted in arrival order. The width comes from
  * `DEVECO_MAX_CONCURRENCY` (1 = strictly one at a time).
+ *
+ * `cooldownMs` (from `DEVECO_QUEUE_COOLDOWN_SEC`) pauses before a waiter is let
+ * through, so consecutive turns don't hammer the backend back-to-back. Only
+ * requests that actually had to queue pay it — one that finds a free slot
+ * starts immediately.
  */
 export class ConcurrencyGate {
   private readonly limit: number
+  private readonly cooldownMs: number
   private active = 0
   private readonly waiters: Array<() => void> = []
 
-  constructor(limit: number) {
+  constructor(limit: number, cooldownMs = 0) {
     this.limit = Math.max(1, Math.floor(limit))
+    this.cooldownMs = Math.max(0, cooldownMs)
   }
 
   async acquire(label: string): Promise<void> {
@@ -109,14 +117,26 @@ export class ConcurrencyGate {
       return
     }
     log.debug(`proxy: queued ${label} (all ${this.limit} upstream slot(s) busy)`)
+    // The slot this waiter eventually gets is handed over by release(), which
+    // keeps it counted as active, so nothing is incremented here.
     await new Promise<void>((resolve) => this.waiters.push(resolve))
-    this.active++
   }
 
   release(): void {
-    this.active--
     const next = this.waiters.shift()
-    if (next) next()
+    if (!next) {
+      this.active--
+      return
+    }
+    // The freed slot moves straight to the next waiter — still counted as
+    // active, so a request arriving during the cooldown queues behind it
+    // instead of stealing the slot that was already promised.
+    if (this.cooldownMs > 0) {
+      log.debug(`proxy: cooling down ${this.cooldownMs}ms before admitting the next queued request`)
+      setTimeout(next, this.cooldownMs)
+    } else {
+      next()
+    }
   }
 }
 
@@ -235,8 +255,9 @@ export class DevEcoProxy {
   private lastLoginTriggeredAt = 0
   private static readonly LOGIN_TRIGGER_COOLDOWN_MS = 5 * 60_000
   // Serialises upstream traffic: DevEco throttles bursts per account, so only
-  // DEVECO_MAX_CONCURRENCY requests run at once and the rest queue.
-  private readonly gate = new ConcurrencyGate(maxConcurrency())
+  // DEVECO_MAX_CONCURRENCY requests run at once and the rest queue. A queued
+  // request additionally waits out DEVECO_QUEUE_COOLDOWN_SEC before it starts.
+  private readonly gate = new ConcurrencyGate(maxConcurrency(), queueCooldownMs())
 
   constructor(opts: ProxyOptions = {}) {
     this.port = opts.port ?? 17128

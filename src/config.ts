@@ -73,6 +73,28 @@ export function maxConcurrency(): number {
   return Number.isInteger(raw) && raw >= 1 ? raw : DEVECO_MAX_CONCURRENCY
 }
 
+/**
+ * Seconds to pause before admitting a request that had to queue, giving DevEco
+ * a breather between burst-adjacent turns. Only queued requests pay it: one
+ * that finds a free slot starts immediately. Override with
+ * DEVECO_QUEUE_COOLDOWN_SEC (fractions allowed, e.g. 0.5); 0 switches the pause
+ * off.
+ */
+export const DEVECO_QUEUE_COOLDOWN_SEC = 1
+
+/**
+ * Resolve the queued-request cooldown in ms. An explicit 0 disables the pause;
+ * a missing or unparseable value falls back to the default.
+ */
+export function queueCooldownMs(): number {
+  const raw = process.env.DEVECO_QUEUE_COOLDOWN_SEC
+  if (raw === undefined || raw.trim() === "") return DEVECO_QUEUE_COOLDOWN_SEC * 1000
+  const sec = Number(raw)
+  return Number.isFinite(sec) && sec >= 0
+    ? Math.round(sec * 1000)
+    : DEVECO_QUEUE_COOLDOWN_SEC * 1000
+}
+
 /** accessToken lifetime in ms (30 min, matching deveco-code). */
 export const ACCESS_TOKEN_EXPIRES_MS = 30 * 60 * 1000
 
