@@ -99,13 +99,24 @@ npm run lint           # 检查代码风格
 node dist/proxy.js
 ```
 
-**Windows —— 隐藏窗口后台进程**（无任务栏窗口；日志写入 `proxy.log`）：
+**带守护进程运行（推荐）**：`npm start` 在监督进程 `dist/daemon.js` 下运行代理，
+代理意外退出时自动重启（退避 1s → 2s → … → 最长 30s，稳定运行超过 60s 后退避重置），
+Ctrl+C 会一并停止两者。不需要守护时用 `npm run start:proxy` 直接跑代理。
+
+```bash
+npm start                     # 守护 + 代理（前台，日志到终端）
+npm start -- --port=17129     # 参数会透传给代理
+```
+
+**Windows —— 隐藏窗口后台进程**（无任务栏窗口；日志写入 `proxy.log`；同样带守护）：
 
 ```powershell
 # 在项目根目录执行
 powershell -ExecutionPolicy Bypass -File scripts\start-windows.ps1
-# 停止：
+# 停止（会先杀守护进程再杀代理）：
 powershell -ExecutionPolicy Bypass -File scripts\stop-windows.ps1
+# 不要守护时：
+powershell -ExecutionPolicy Bypass -File scripts\start-windows.ps1 -NoWatchdog
 ```
 
 > 开机自启：用任务计划程序（或在"启动"文件夹放一个快捷方式）运行 `start-windows.ps1`。
@@ -129,6 +140,7 @@ journalctl --user -u opencode-deveco -f   # 实时看日志
 ```
 
 > 这个 systemd unit 在用户登录时自启。要实现开机自启（登录前就启动）运行 `loginctl enable-linger $USER`。
+> systemd 自身就会重启进程（`Restart=on-failure`），所以这里继续直接运行 `dist/proxy.js`，不必再套一层 `daemon.js`。
 
 **macOS —— launchd 用户代理（自启 + 自动重启）：**
 
@@ -144,7 +156,8 @@ tail -f ~/Library/Logs/opencode-deveco.log   # 实时看日志
 
 > 必须用 LaunchAgent 而不是 LaunchDaemon —— agent 跑在你已登录的图形会话里，
 > 自动打开浏览器登录才能生效。launchd 不读 shell 配置且 `PATH` 极简，
-> 所以 plist 里要写 `node` 的绝对路径（用 `which node` 查）。
+> 所以 plist 里要写 `node` 的绝对路径（用 `which node` 查）。同样地，launchd
+> 自带 KeepAlive 重启，无需再套 `daemon.js`。
 
 ### 4. 登录
 

@@ -112,13 +112,26 @@ The proxy listens on `127.0.0.1:17128` by default. Override with
 node dist/proxy.js
 ```
 
-**Windows — hidden background process** (no taskbar window; logs → `proxy.log`):
+**Supervised (recommended)** — `npm start` runs the proxy under the supervisor
+`dist/daemon.js`, which relaunches it whenever it exits (backoff 1s → 2s → …
+capped at 30s, reset after a run that survived 60s). Ctrl+C stops both. Use
+`npm run start:proxy` to run the proxy alone.
+
+```bash
+npm start                     # supervisor + proxy (foreground, logs to terminal)
+npm start -- --port=17129     # arguments are passed through to the proxy
+```
+
+**Windows — hidden background process** (no taskbar window; logs → `proxy.log`;
+supervised as well):
 
 ```powershell
 # from the project root
 powershell -ExecutionPolicy Bypass -File scripts\start-windows.ps1
-# stop it later:
+# stop it later (kills the supervisor first, then the proxy):
 powershell -ExecutionPolicy Bypass -File scripts\stop-windows.ps1
+# without the watchdog:
+powershell -ExecutionPolicy Bypass -File scripts\start-windows.ps1 -NoWatchdog
 ```
 
 > For autostart on login: create a Task Scheduler task (or a shortcut in the
@@ -143,7 +156,9 @@ journalctl --user -u opencode-deveco -f   # follow logs
 ```
 
 > The systemd unit enables lingering-free autostart on login. For boot-time
-> autostart (before login) run `loginctl enable-linger $USER`.
+> autostart (before login) run `loginctl enable-linger $USER`. systemd already
+> restarts the process (`Restart=on-failure`), so keep running `dist/proxy.js`
+> here — no need to stack `daemon.js` on top.
 
 **macOS — launchd user agent (autostart + auto-restart):**
 
