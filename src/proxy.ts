@@ -28,6 +28,7 @@ import {
   UPSTREAM_IDLE_TIMEOUT_MS,
   log,
   maxConcurrency,
+  maxQueue,
   queueCooldownMs,
 } from "./config.js"
 import { createLoginService, userInfoFromJwt, type RefreshResult, type UserInfo } from "./auth-login.js"
@@ -91,13 +92,24 @@ export function idleBudget(idleMs: number): {
 }
 
 /**
+ * How an `acquire` ended: `admitted` = slot granted (the caller then owes one
+ * `release()`), `abandoned` = the caller gave up while queued (no slot, nothing
+ * owed), `queue-full` = the queue was at capacity, so the request was refused
+ * and never entered it.
+ */
+export type AcquireOutcome = "admitted" | "abandoned" | "queue-full"
+
+/** Client-visible message of the 429 answering a `queue-full` refusal. */
+const QUEUE_FULL_MESSAGE = "proxy request queue is full, please retry shortly"
+
+/**
  * A queued request waiting for a slot. `granted` marks the moment release()
  * promises the slot to it (the cooldown timer is what delays the hand-over).
  */
 interface Waiter {
   label: string
-  /** `true` = admitted (one release() owed), `false` = caller gave up, no slot. */
-  resolve: (admitted: boolean) => void
+  /** `admitted` = one release() owed; `abandoned` = caller gave up, no slot. */
+  resolve: (outcome: AcquireOutcome) => void
   enqueuedAt: number
   granted: boolean
   timer: ReturnType<typeof setTimeout> | null
@@ -115,35 +127,47 @@ interface Waiter {
  * through, so consecutive turns don't hammer the backend back-to-back. Only
  * requests that actually had to queue pay it — one that finds a free slot
  * starts immediately.
+ *
+ * The queue itself is bounded by `maxQueue` (from `DEVECO_MAX_QUEUE`): a
+ * request arriving at a full queue is refused (`queue-full`) rather than
+ * stacked, so the backlog can't grow without limit behind a long turn.
  */
 export class ConcurrencyGate {
   private readonly limit: number
   private readonly cooldownMs: number
+  private readonly maxQueue: number
   private active = 0
   private readonly waiters: Waiter[] = []
 
-  constructor(limit: number, cooldownMs = 0) {
+  constructor(limit: number, cooldownMs = 0, maxQueue = Number.POSITIVE_INFINITY) {
     this.limit = Math.max(1, Math.floor(limit))
     this.cooldownMs = Math.max(0, cooldownMs)
+    this.maxQueue = Math.max(0, Math.floor(maxQueue))
   }
 
   /**
-   * Take a slot, or wait for one. Resolves `true` when admitted — the caller
-   * then owes exactly one `release()` — and `false` when `signal` aborted while
-   * queued, in which case no slot was taken and nothing is owed. Without the
-   * signal an abandoned waiter was still admitted later, just to notice its
-   * client was gone, and that hand-over cost the queue another cooldown.
+   * Take a slot, or wait for one. `admitted` means the caller owes exactly one
+   * `release()`; `abandoned` means `signal` aborted while queued, in which case
+   * no slot was taken and nothing is owed. Without the signal an abandoned
+   * waiter was still admitted later, just to notice its client was gone, and
+   * that hand-over cost the queue another cooldown. `queue-full` means the
+   * queue already held `maxQueue` waiters: the request was not accepted, so a
+   * burst is answered with 429s instead of unbounded waiting.
    */
-  async acquire(label: string, signal?: AbortSignal): Promise<boolean> {
-    if (signal?.aborted) return false
+  async acquire(label: string, signal?: AbortSignal): Promise<AcquireOutcome> {
+    if (signal?.aborted) return "abandoned"
     if (this.active < this.limit) {
       this.active++
-      return true
+      return "admitted"
+    }
+    if (this.waiters.length >= this.maxQueue) {
+      log.warn(`proxy: queue full (${this.waiters.length} waiting), refusing ${label}`)
+      return "queue-full"
     }
     log.debug(
       `proxy: queued ${label} (all ${this.limit} upstream slot(s) busy, ${this.waiters.length} ahead)`,
     )
-    return new Promise<boolean>((resolve) => {
+    return new Promise<AcquireOutcome>((resolve) => {
       const waiter: Waiter = {
         label,
         resolve,
@@ -178,7 +202,7 @@ export class ConcurrencyGate {
         `proxy: admitted ${next.label} after ${Date.now() - next.enqueuedAt}ms ` +
           `(${this.waiters.length} still queued)`,
       )
-      next.resolve(true)
+      next.resolve("admitted")
     }
     if (this.cooldownMs > 0) {
       log.debug(`proxy: cooling down ${this.cooldownMs}ms before admitting the next queued request`)
@@ -199,7 +223,7 @@ export class ConcurrencyGate {
       if (waiter.timer) clearTimeout(waiter.timer)
       waiter.timer = null
       log.debug(`proxy: ${waiter.label} left during the cooldown, passing its slot on`)
-      waiter.resolve(false)
+      waiter.resolve("abandoned")
       this.release()
       return
     }
@@ -207,7 +231,7 @@ export class ConcurrencyGate {
     if (idx >= 0) this.waiters.splice(idx, 1)
     waiter.detach()
     log.debug(`proxy: dropped queued ${waiter.label} (caller gone)`)
-    waiter.resolve(false)
+    waiter.resolve("abandoned")
   }
 }
 
@@ -326,11 +350,12 @@ export class DevEcoProxy {
   private lastLoginTriggeredAt = 0
   private static readonly LOGIN_TRIGGER_COOLDOWN_MS = 5 * 60_000
   // Serialises generation turns: DevEco throttles bursts per account, so only
-  // DEVECO_MAX_CONCURRENCY turns run at once and the rest queue. A queued turn
-  // additionally waits out DEVECO_QUEUE_COOLDOWN_SEC before it starts. Metadata
-  // reads (/status, /models, /login…) never touch the gate — nothing about them
-  // deserves a turn's slot.
-  private readonly gate = new ConcurrencyGate(maxConcurrency(), queueCooldownMs())
+  // DEVECO_MAX_CONCURRENCY turns run at once and the rest queue (at most
+  // DEVECO_MAX_QUEUE of them — beyond that the client gets a 429 and can back
+  // off). A queued turn additionally waits out DEVECO_QUEUE_COOLDOWN_SEC before
+  // it starts. Metadata reads (/status, /models, /login…) never touch the gate
+  // — nothing about them deserves a turn's slot.
+  private readonly gate = new ConcurrencyGate(maxConcurrency(), queueCooldownMs(), maxQueue())
 
   constructor(opts: ProxyOptions = {}) {
     this.port = opts.port ?? 17128
@@ -814,8 +839,13 @@ export class DevEcoProxy {
     // upstream exchange, and the log order matches what the backend saw. The
     // signal makes the wait cancellable, so a client that leaves while queued is
     // dropped (no slot, no upstream call, no cooldown charged to those behind).
-    const admitted = await this.gate.acquire(`chat ${model}`, clientGone.signal)
-    if (!admitted) {
+    const outcome = await this.gate.acquire(`chat ${model}`, clientGone.signal)
+    if (outcome === "queue-full") {
+      return this.json(res, 429, {
+        error: { message: QUEUE_FULL_MESSAGE, type: "rate_limit_error" },
+      })
+    }
+    if (outcome === "abandoned") {
       log.debug("proxy: client gone while queued, skipping chat turn", { model })
       return
     }
@@ -948,8 +978,14 @@ export class DevEcoProxy {
     // goes to the next turn only after exitQueue settles. Callers that still owe
     // the client a response fire it without awaiting — the release happens
     // either way.
-    const admitted = await this.gate.acquire(`anthropic ${model}`, clientGone.signal)
-    if (!admitted) {
+    const outcome = await this.gate.acquire(`anthropic ${model}`, clientGone.signal)
+    if (outcome === "queue-full") {
+      return this.json(res, 429, {
+        type: "error",
+        error: { type: "rate_limit_error", message: QUEUE_FULL_MESSAGE },
+      })
+    }
+    if (outcome === "abandoned") {
       log.debug("proxy: client gone while queued, skipping anthropic turn", { model })
       return
     }

@@ -401,6 +401,12 @@ behind each.
   backend back-to-back. A request that finds a free slot still starts
   immediately, and the cooling slot stays reserved for the waiter so a
   latecomer can't take it.
+- **The queue is bounded** — at most `DEVECO_MAX_QUEUE` (default `3`) requests
+  may wait for a slot; anything beyond that is refused on the spot with `429`
+  (`rate_limit_error`) instead of stacking up behind a long turn, so a burst
+  can't become an endless backlog. `0` means "never queue": no free slot, no
+  waiting. A refused request takes no slot and doesn't disturb the waiters
+  already queued.
 - **Turns hand over cleanly** — a finished turn's slot is passed to the next
   queued turn only once DevEco confirms the server-side queue slot is released
   (`exitSessionQueue`), capped at 3s so a wedged release call can't stall the

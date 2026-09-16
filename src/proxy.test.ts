@@ -5,7 +5,7 @@ import path from "node:path"
 import { browserOpenCommand, parseJwt, parseRealName, userInfoFromJwt } from "./auth-login.js"
 import { ConcurrencyGate, conversationKey, DevEcoProxy, idleBudget, sessionKeyFromHeaders } from "./proxy.js"
 import { JsonTokenStore } from "./token-store.js"
-import { log, queueCooldownMs } from "./config.js"
+import { log, maxQueue, queueCooldownMs } from "./config.js"
 
 // Helper: build a minimal JWT (header.payload.signature) with a given payload.
 function makeJwt(payload: Record<string, unknown>): string {
@@ -188,6 +188,31 @@ describe("queueCooldownMs", () => {
   })
 })
 
+describe("maxQueue", () => {
+  const OLD = process.env.DEVECO_MAX_QUEUE
+
+  afterEach(() => {
+    if (OLD === undefined) delete process.env.DEVECO_MAX_QUEUE
+    else process.env.DEVECO_MAX_QUEUE = OLD
+  })
+
+  it("defaults to three waiting requests", () => {
+    delete process.env.DEVECO_MAX_QUEUE
+    expect(maxQueue()).toBe(3)
+  })
+
+  it("accepts an explicit zero (never queue) and ignores junk", () => {
+    process.env.DEVECO_MAX_QUEUE = "0"
+    expect(maxQueue()).toBe(0)
+    process.env.DEVECO_MAX_QUEUE = "5"
+    expect(maxQueue()).toBe(5)
+    for (const bad of ["", "  ", "-1", "abc", "1.5"]) {
+      process.env.DEVECO_MAX_QUEUE = bad
+      expect(maxQueue()).toBe(3)
+    }
+  })
+})
+
 describe("ConcurrencyGate", () => {
   const tick = () => new Promise((r) => setTimeout(r, 0))
   // Drains pending microtasks only, never timers: an admission that is gated on
@@ -330,9 +355,9 @@ describe("ConcurrencyGate", () => {
     const ctrl = new AbortController()
     ctrl.abort()
     // Never enters the queue, so waiting on it costs the gate nothing.
-    expect(await gate.acquire("dead", ctrl.signal)).toBe(false)
+    expect(await gate.acquire("dead", ctrl.signal)).toBe("abandoned")
     gate.release()
-    expect(await gate.acquire("next")).toBe(true)
+    expect(await gate.acquire("next")).toBe("admitted")
     gate.release()
   })
 
@@ -342,11 +367,11 @@ describe("ConcurrencyGate", () => {
     const ctrl = new AbortController()
     const dead = gate.acquire("dead", ctrl.signal)
     let liveAdmitted = false
-    const live = gate.acquire("live").then((ok: boolean) => (liveAdmitted = ok))
+    const live = gate.acquire("live").then((outcome) => (liveAdmitted = outcome === "admitted"))
     ctrl.abort()
     // The abandoned waiter resolves without a slot — it is not admitted first
     // just to notice its client is gone (which is what it used to do).
-    expect(await dead).toBe(false)
+    expect(await dead).toBe("abandoned")
     gate.release()
     await live
     expect(liveAdmitted).toBe(true)
@@ -361,12 +386,59 @@ describe("ConcurrencyGate", () => {
     await tick()
     gate.release() // `dead` is granted and now cooling down
     let liveAdmitted = false
-    const live = gate.acquire("live").then((ok: boolean) => (liveAdmitted = ok))
+    const live = gate.acquire("live").then((outcome) => (liveAdmitted = outcome === "admitted"))
     ctrl.abort()
-    expect(await dead).toBe(false)
+    expect(await dead).toBe("abandoned")
     // The promised slot was not dropped with it: the waiter behind still gets in.
     await live
     expect(liveAdmitted).toBe(true)
+    gate.release()
+  })
+
+  // --- bounded queue length --------------------------------------------------
+
+  it("refuses a request once the queue is at capacity", async () => {
+    const gate = new ConcurrencyGate(1, 0, 1)
+    await gate.acquire("holder")
+    const queued = gate.acquire("queued")
+    await tick()
+    // One waiter is allowed; the request arriving behind it is refused outright
+    // instead of growing the backlog.
+    expect(await gate.acquire("overflow")).toBe("queue-full")
+    gate.release()
+    expect(await queued).toBe("admitted")
+    gate.release()
+    // The refusal never took a slot: the gate is idle again.
+    expect(await gate.acquire("later")).toBe("admitted")
+    gate.release()
+  })
+
+  it("treats a zero-length queue as 'never queue'", async () => {
+    const gate = new ConcurrencyGate(1, 0, 0)
+    await gate.acquire("holder")
+    expect(await gate.acquire("second")).toBe("queue-full")
+    gate.release()
+    expect(await gate.acquire("later")).toBe("admitted")
+    gate.release()
+  })
+
+  it("frees queue capacity as waiters are admitted", async () => {
+    const gate = new ConcurrencyGate(1, 0, 2)
+    await gate.acquire("holder")
+    const first = gate.acquire("first")
+    const second = gate.acquire("second")
+    await tick()
+    expect(await gate.acquire("overflow")).toBe("queue-full")
+    gate.release() // admits `first`
+    expect(await first).toBe("admitted")
+    // `first` holds the slot now, and only `second` is left waiting: room again.
+    const third = gate.acquire("third")
+    await tick()
+    expect(await gate.acquire("fourth")).toBe("queue-full")
+    gate.release()
+    expect(await second).toBe("admitted")
+    gate.release()
+    expect(await third).toBe("admitted")
     gate.release()
   })
 })
@@ -931,6 +1003,78 @@ describe("DevEcoProxy integration", () => {
       expect(upstreamStarts[1] - slotFreedAt).toBeGreaterThanOrEqual(250)
     } finally {
       delete process.env.DEVECO_QUEUE_COOLDOWN_SEC
+    }
+  })
+
+  it("answers 429 when the queue is already full instead of stacking more turns", async () => {
+    const fresh = makeJwt({ userId: "u1", userName: "New", exp: Math.floor(Date.now() / 1000) + 3600 })
+    await new JsonTokenStore().save(fresh)
+
+    let releaseFirstTurn!: () => void
+    const firstTurnHeld = new Promise<void>((resolve) => {
+      releaseFirstTurn = resolve
+    })
+    let upstreamTurns = 0
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes("127.0.0.1")) return originalFetch(input, init)
+      if (url.includes("jwToken/check") || url.includes("exitSessionQueue")) {
+        return mockUpstreamFetch(input, init)
+      }
+      upstreamTurns++
+      if (upstreamTurns === 1) await firstTurnHeld
+      return new Response(
+        JSON.stringify({
+          id: "chatcmpl-full",
+          object: "chat.completion",
+          model: "GLM-5.1",
+          choices: [
+            { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    // A one-deep queue keeps the assertion short; the cooldown is unrelated here.
+    process.env.DEVECO_QUEUE_COOLDOWN_SEC = "0"
+    process.env.DEVECO_MAX_QUEUE = "1"
+    try {
+      const p = await startProxy()
+      const logged = spyOnDebugLog()
+      const chatUrl = `http://127.0.0.1:${p.getPort()}/v2/chat/completions`
+      const post = () =>
+        fetch(chatUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "GLM-5.1", messages: [{ role: "user", content: "hi" }] }),
+        })
+
+      const first = post()
+      await vi.waitFor(() => expect(upstreamTurns).toBe(1), { timeout: 2000 })
+
+      // Fills the queue while the only slot is busy.
+      const queued = post()
+      await vi.waitFor(() => expect(logged("proxy: queued")).toBe(true), { timeout: 2000 })
+
+      // The next caller is refused outright (had it queued, this await would
+      // hang until the test's own timeout).
+      const refused = await post()
+      expect(refused.status).toBe(429)
+      const body = (await refused.json()) as { error: { type: string; message: string } }
+      expect(body.error.type).toBe("rate_limit_error")
+      expect(body.error.message).toContain("queue is full")
+
+      releaseFirstTurn()
+      expect((await first).status).toBe(200)
+      expect((await queued).status).toBe(200)
+      // Only the two accepted turns ever reached upstream.
+      expect(upstreamTurns).toBe(2)
+    } finally {
+      delete process.env.DEVECO_QUEUE_COOLDOWN_SEC
+      delete process.env.DEVECO_MAX_QUEUE
     }
   })
 

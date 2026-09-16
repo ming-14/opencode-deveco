@@ -84,6 +84,24 @@ export function maxConcurrency(): number {
 }
 
 /**
+ * How many requests may wait for a slot at once. Anything beyond that is
+ * refused with HTTP 429 instead of queued: an unbounded queue turns a burst
+ * into an ever-growing backlog whose symptom is "the client just hangs",
+ * whereas a refusal lets the caller back off and retry. 0 = never queue
+ * (a request is refused as soon as no slot is free). Override with
+ * DEVECO_MAX_QUEUE.
+ */
+export const DEVECO_MAX_QUEUE = 3
+
+/** Resolve the queue length cap; a missing or invalid override means default. */
+export function maxQueue(): number {
+  const raw = process.env.DEVECO_MAX_QUEUE
+  if (raw === undefined || raw.trim() === "") return DEVECO_MAX_QUEUE
+  const n = Number(raw)
+  return Number.isInteger(n) && n >= 0 ? n : DEVECO_MAX_QUEUE
+}
+
+/**
  * Seconds to pause before admitting a request that had to queue, giving DevEco
  * a breather between burst-adjacent turns. Only queued requests pay it: one
  * that finds a free slot starts immediately. Override with
