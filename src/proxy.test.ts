@@ -3,7 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { browserOpenCommand, parseJwt, parseRealName, userInfoFromJwt } from "./auth-login.js"
-import { conversationKey, DevEcoProxy, idleBudget, sessionKeyFromHeaders } from "./proxy.js"
+import { ConcurrencyGate, conversationKey, DevEcoProxy, idleBudget, sessionKeyFromHeaders } from "./proxy.js"
 import { JsonTokenStore } from "./token-store.js"
 import { log } from "./config.js"
 
@@ -162,6 +162,64 @@ describe("idleBudget", () => {
     b.done()
     await sleep(200)
     expect(b.signal.aborted).toBe(false)
+  })
+})
+
+describe("ConcurrencyGate", () => {
+  const tick = () => new Promise((r) => setTimeout(r, 0))
+
+  it("admits up to `limit` holders at once and queues the rest", async () => {
+    const gate = new ConcurrencyGate(2)
+    const order: number[] = []
+    let running = 0
+    let peak = 0
+
+    const task = async (id: number) => {
+      await gate.acquire(`t${id}`)
+      running++
+      peak = Math.max(peak, running)
+      order.push(id)
+      await tick()
+      running--
+      gate.release()
+    }
+
+    await Promise.all([task(1), task(2), task(3)])
+    expect(peak).toBe(2)
+    // The third waits for a slot instead of failing.
+    expect(order).toEqual([1, 2, 3])
+  })
+
+  it("serves waiters in arrival order after releases", async () => {
+    const gate = new ConcurrencyGate(1)
+    const order: number[] = []
+    const task = async (id: number) => {
+      await gate.acquire(`t${id}`)
+      order.push(id)
+      await tick()
+      gate.release()
+    }
+    await Promise.all([task(1), task(2), task(3), task(4)])
+    expect(order).toEqual([1, 2, 3, 4])
+  })
+
+  it("never exceeds the limit even when a holder throws", async () => {
+    const gate = new ConcurrencyGate(1)
+    let running = 0
+    let peak = 0
+    const task = async () => {
+      await gate.acquire("boom")
+      running++
+      peak = Math.max(peak, running)
+      try {
+        throw new Error("upstream blew up")
+      } finally {
+        running--
+        gate.release()
+      }
+    }
+    await Promise.allSettled([task(), task()])
+    expect(peak).toBe(1)
   })
 })
 
@@ -393,5 +451,65 @@ describe("DevEcoProxy integration", () => {
     // Still serving: the next request must not find a dead process.
     const status = await (await fetch(`http://127.0.0.1:${p.getPort()}/v2/status`)).json()
     expect(status.logged_in).toBe(true)
+  })
+
+  it("serialises upstream requests and honours DEVECO_MAX_CONCURRENCY", async () => {
+    const fresh = makeJwt({ userId: "u1", userName: "New", exp: Math.floor(Date.now() / 1000) + 3600 })
+    await new JsonTokenStore().save(fresh)
+
+    let inFlight = 0
+    let peak = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes("127.0.0.1")) return originalFetch(input, init)
+      if (url.includes("jwToken/check") || url.includes("exitSessionQueue")) {
+        return mockUpstreamFetch(input, init)
+      }
+      inFlight++
+      peak = Math.max(peak, inFlight)
+      await new Promise((r) => setTimeout(r, 120))
+      inFlight--
+      return new Response(
+        JSON.stringify({
+          id: "chatcmpl-gate",
+          object: "chat.completion",
+          model: "GLM-5.1",
+          choices: [
+            { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    const chat = (port: number) =>
+      fetch(`http://127.0.0.1:${port}/v2/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "GLM-5.1", messages: [{ role: "user", content: "hi" }] }),
+      })
+
+    try {
+      // Default: one upstream request at a time, the rest queue.
+      delete process.env.DEVECO_MAX_CONCURRENCY
+      const serial = await startProxy()
+      await Promise.all([chat(serial.getPort()), chat(serial.getPort()), chat(serial.getPort())])
+      expect(peak).toBe(1)
+
+      // Raised cap: two may overlap, the third still waits.
+      await serial.stop()
+      peak = 0
+      process.env.DEVECO_MAX_CONCURRENCY = "2"
+      const parallel = await startProxy()
+      await Promise.all([
+        chat(parallel.getPort()),
+        chat(parallel.getPort()),
+        chat(parallel.getPort()),
+      ])
+      expect(peak).toBe(2)
+    } finally {
+      delete process.env.DEVECO_MAX_CONCURRENCY
+    }
   })
 })

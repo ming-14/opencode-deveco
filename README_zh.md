@@ -231,6 +231,7 @@ opencode run "say hi" -m deveco/GLM-5.1   # 通过代理发真实请求
 |---|---|---|
 | `DEVECO_VISION_MODEL` | `Qwen3_VL_235B_A22B_Instruct` | 识图兜底模型 |
 | `DEVECO_TEXT_ONLY_MODELS` | `GLM-5.1` | 视为纯文本的模型，逗号分隔 |
+| `DEVECO_MAX_CONCURRENCY` | `1` | 允许同时在跑的上游请求数，超出部分按到达顺序排队（默认串行） |
 
 ## 会话稳定性（避免“几轮后无响应”）
 

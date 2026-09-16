@@ -60,6 +60,19 @@ export const DEVECO_TEXT_ONLY_MODELS = ["GLM-5.1"]
  */
 export const UPSTREAM_IDLE_TIMEOUT_MS = 120_000
 
+/**
+ * How many upstream requests may be in flight at once. DevEco throttles bursts
+ * per account, so the default is one at a time and latecomers queue instead of
+ * failing. Override with DEVECO_MAX_CONCURRENCY.
+ */
+export const DEVECO_MAX_CONCURRENCY = 1
+
+/** Resolve the concurrency cap, ignoring a missing or invalid override. */
+export function maxConcurrency(): number {
+  const raw = Number(process.env.DEVECO_MAX_CONCURRENCY)
+  return Number.isInteger(raw) && raw >= 1 ? raw : DEVECO_MAX_CONCURRENCY
+}
+
 /** accessToken lifetime in ms (30 min, matching deveco-code). */
 export const ACCESS_TOKEN_EXPIRES_MS = 30 * 60 * 1000
 

@@ -26,6 +26,7 @@ import {
   DEVECO_EXIT_QUEUE_URL,
   UPSTREAM_IDLE_TIMEOUT_MS,
   log,
+  maxConcurrency,
 } from "./config.js"
 import { createLoginService, userInfoFromJwt, type RefreshResult, type UserInfo } from "./auth-login.js"
 import { JsonTokenStore } from "./token-store.js"
@@ -85,6 +86,38 @@ export function idleBudget(idleMs: number): {
   }
   touch()
   return { signal: controller.signal, touch, done }
+}
+
+/**
+ * FIFO semaphore capping how many upstream requests run at once. DevEco
+ * throttles bursts per account, so a burst degrades into a queue instead of a
+ * failure; waiters are admitted in arrival order. The width comes from
+ * `DEVECO_MAX_CONCURRENCY` (1 = strictly one at a time).
+ */
+export class ConcurrencyGate {
+  private readonly limit: number
+  private active = 0
+  private readonly waiters: Array<() => void> = []
+
+  constructor(limit: number) {
+    this.limit = Math.max(1, Math.floor(limit))
+  }
+
+  async acquire(label: string): Promise<void> {
+    if (this.active < this.limit) {
+      this.active++
+      return
+    }
+    log.debug(`proxy: queued ${label} (all ${this.limit} upstream slot(s) busy)`)
+    await new Promise<void>((resolve) => this.waiters.push(resolve))
+    this.active++
+  }
+
+  release(): void {
+    this.active--
+    const next = this.waiters.shift()
+    if (next) next()
+  }
 }
 
 /**
@@ -167,6 +200,9 @@ export class DevEcoProxy {
   // Explicit GET /v2/login is never throttled.
   private lastLoginTriggeredAt = 0
   private static readonly LOGIN_TRIGGER_COOLDOWN_MS = 5 * 60_000
+  // Serialises upstream traffic: DevEco throttles bursts per account, so only
+  // DEVECO_MAX_CONCURRENCY requests run at once and the rest queue.
+  private readonly gate = new ConcurrencyGate(maxConcurrency())
 
   constructor(opts: ProxyOptions = {}) {
     this.port = opts.port ?? 17128
@@ -486,10 +522,15 @@ export class DevEcoProxy {
       if (p === "/models") {
         // Listing models must not pop a browser: use the current session when
         // available and fall back to the static defaults when logged out.
-        const token = await this.ensureToken(false)
-        const cfg = await getDevecoProviderConfig(token)
-        const data = Object.keys(cfg.models ?? {}).map((id) => ({ id, object: "model" }))
-        return this.json(res, 200, { object: "list", data })
+        await this.gate.acquire("models")
+        try {
+          const token = await this.ensureToken(false)
+          const cfg = await getDevecoProviderConfig(token)
+          const data = Object.keys(cfg.models ?? {}).map((id) => ({ id, object: "model" }))
+          return this.json(res, 200, { object: "list", data })
+        } finally {
+          this.gate.release()
+        }
       }
 
       if (p === "/chat/completions" && req.method === "POST") {
@@ -606,6 +647,9 @@ export class DevEcoProxy {
       bodyInit = Buffer.from(JSON.stringify(routedBody)) as unknown as BodyInit
     }
 
+    // Wait for an upstream slot first: the logged duration then measures the
+    // upstream exchange, and the log order matches what the backend saw.
+    await this.gate.acquire(`chat ${model}`)
     const ctx = { model, stream, upstreamUrl, t0: Date.now() }
     log.info(
       `-> POST ${stream ? "stream" : "no-stream"} model=${model}` +
@@ -655,6 +699,9 @@ export class DevEcoProxy {
     } finally {
       budget.done()
       this.exitQueue(convKey, chatId, upstreamModel, accessToken)
+      // Released last: the next queued request must not start while this one
+      // is still streaming.
+      this.gate.release()
     }
   }
 
@@ -718,6 +765,9 @@ export class DevEcoProxy {
       "accept-language": "zh-CN",
     }
 
+    // Wait for an upstream slot first: the logged duration then measures the
+    // upstream exchange, and the log order matches what the backend saw.
+    await this.gate.acquire(`anthropic ${model}`)
     const t0 = Date.now()
     log.info(
       `-> POST anthropic/${isStream ? "stream" : "no-stream"} model=${model}` +
@@ -728,6 +778,7 @@ export class DevEcoProxy {
     const finishTurn = () => {
       budget.done()
       this.exitQueue(convKey, chatId, upstreamModel, accessToken)
+      this.gate.release()
     }
 
     let upstream: Response
