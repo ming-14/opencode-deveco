@@ -30,7 +30,10 @@ import { JsonTokenStore } from "./token-store.js"
 import { getDevecoProviderConfig, resetModelCache } from "./models.js"
 import { DevEcoProxy, conversationKey } from "./proxy.js"
 import { applyVisionRouting } from "./vision-routing.js"
-import { normalizeOpenAIToolChoice } from "./openai-normalize.js"
+import {
+  normalizeOpenAIDeveloperRole,
+  normalizeOpenAIToolChoice,
+} from "./openai-normalize.js"
 
 // Default local proxy port. Kept in sync with README and the standalone CLI.
 const PROXY_PORT = Number(process.env.DEVECO_PROXY_PORT) || 17128
@@ -228,13 +231,15 @@ function buildAuthedFetch(
           headers.get("x-session-id")
         convKey = explicit || conversationKey(parsed)
 
-        // Same DevEco quirks as the proxy: enum-only tool_choice and the
-        // transparent vision fallback.
-        const normalized = normalizeOpenAIToolChoice(parsed)
-        const routing = applyVisionRouting(normalized.body)
+        // Same DevEco quirks as the proxy: enum-only tool_choice, the
+        // "developer" role downgrade and the transparent vision fallback.
+        const roles = normalizeOpenAIDeveloperRole(parsed)
+        const toolChoice = normalizeOpenAIToolChoice(roles.body)
+        const quirksChanged = roles.changed || toolChoice.changed
+        const routing = applyVisionRouting(toolChoice.body)
         if (routing) {
           upstreamModel = routing.upstreamModel
-          if (routing.rerouted || routing.imagesStripped || normalized.changed) {
+          if (routing.rerouted || routing.imagesStripped || quirksChanged) {
             bodyForFetch = JSON.stringify(routing.body)
           }
         }

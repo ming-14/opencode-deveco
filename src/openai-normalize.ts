@@ -5,10 +5,15 @@
 // {type:"tool",name}) makes the upstream reject the whole request with a
 // ToolChoiceMode deserialisation error, so the proxy rewrites it the same way
 // the Anthropic transform does: "required" + narrow `tools` to that one tool.
+//
+// DevEco's message `role` is an enum too: only "function" | "user" |
+// "assistant" | "system" | "tool" are accepted. The newer OpenAI "developer"
+// role still makes the upstream reject the whole request with a Role
+// deserialisation error, so it is downgraded to "system".
 
 import { log } from "./config.js"
 
-export interface ToolChoiceNormalization {
+export interface BodyNormalization {
   body: Record<string, unknown>
   changed: boolean
 }
@@ -34,7 +39,7 @@ function narrowTools(tools: unknown, name: string): unknown[] | null {
 
 export function normalizeOpenAIToolChoice(
   body: Record<string, unknown>,
-): ToolChoiceNormalization {
+): BodyNormalization {
   const choice = body.tool_choice
   if (choice === undefined || typeof choice === "string") {
     return { body, changed: false }
@@ -73,4 +78,29 @@ export function normalizeOpenAIToolChoice(
 
   log.warn("proxy: unsupported tool_choice object, falling back to auto")
   return { body: { ...body, tool_choice: "auto" }, changed: true }
+}
+
+/**
+ * Downgrade OpenAI's "developer" role to "system". SDKs routinely emit it for
+ * any endpoint they assume to be OpenAI-compatible; DevEco's Role enum has no
+ * such member and answers with a 400 before the model is ever called.
+ */
+export function normalizeOpenAIDeveloperRole(
+  body: Record<string, unknown>,
+): BodyNormalization {
+  const messages = body.messages
+  if (!Array.isArray(messages)) return { body, changed: false }
+
+  let changed = false
+  const rewritten = messages.map((message) => {
+    if (!message || typeof message !== "object") return message
+    const msg = message as Record<string, unknown>
+    if (msg.role !== "developer") return message
+    changed = true
+    return { ...msg, role: "system" }
+  })
+  if (!changed) return { body, changed: false }
+
+  log.debug("proxy: message role developer → system")
+  return { body: { ...body, messages: rewritten }, changed: true }
 }

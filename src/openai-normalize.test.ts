@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest"
-import { normalizeOpenAIToolChoice } from "./openai-normalize.js"
+import {
+  normalizeOpenAIDeveloperRole,
+  normalizeOpenAIToolChoice,
+} from "./openai-normalize.js"
 
 function tool(name: string) {
   return { type: "function", function: { name } }
@@ -52,5 +55,48 @@ describe("normalizeOpenAIToolChoice", () => {
     const r = normalizeOpenAIToolChoice({ tool_choice: 42 })
     expect(r.changed).toBe(true)
     expect("tool_choice" in r.body).toBe(false)
+  })
+})
+
+describe("normalizeOpenAIDeveloperRole", () => {
+  it("downgrades every developer message to system, content intact", () => {
+    const body = {
+      model: "GLM-5.1",
+      messages: [
+        { role: "developer", content: "You are a coding agent." },
+        { role: "user", content: "hi" },
+        { role: "developer", content: "Extra instructions." },
+      ],
+    }
+    const r = normalizeOpenAIDeveloperRole(body)
+    expect(r.changed).toBe(true)
+    expect(r.body.messages).toEqual([
+      { role: "system", content: "You are a coding agent." },
+      { role: "user", content: "hi" },
+      { role: "system", content: "Extra instructions." },
+    ])
+    expect(body.messages[0].role).toBe("developer")
+  })
+
+  it("leaves system/user/assistant/tool messages untouched", () => {
+    const body = {
+      messages: [
+        { role: "system", content: "s" },
+        { role: "user", content: "u" },
+        { role: "assistant", content: "a" },
+        { role: "tool", content: "t", tool_call_id: "1" },
+      ],
+    }
+    const r = normalizeOpenAIDeveloperRole(body)
+    expect(r.changed).toBe(false)
+    expect(r.body).toBe(body)
+  })
+
+  it("tolerates a missing or malformed messages array", () => {
+    expect(normalizeOpenAIDeveloperRole({}).changed).toBe(false)
+    expect(normalizeOpenAIDeveloperRole({ messages: "nope" }).changed).toBe(false)
+    const r = normalizeOpenAIDeveloperRole({ messages: [null, 7, { role: "developer", content: "x" }] })
+    expect(r.changed).toBe(true)
+    expect(r.body.messages).toEqual([null, 7, { role: "system", content: "x" }])
   })
 })

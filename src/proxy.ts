@@ -37,7 +37,10 @@ import {
   type AnthropicRequest,
 } from "./anthropic-transform.js"
 import { applyVisionRouting } from "./vision-routing.js"
-import { normalizeOpenAIToolChoice } from "./openai-normalize.js"
+import {
+  normalizeOpenAIDeveloperRole,
+  normalizeOpenAIToolChoice,
+} from "./openai-normalize.js"
 
 const DEVECO_ORIGIN = new URL(DEVECO_API_BASE).origin // https://cn.devecostudio.huawei.com
 const DEVECO_API_PREFIX = new URL(DEVECO_API_BASE).pathname.replace(/\/$/, "") // /sse/codeGenie/maas/v2
@@ -562,12 +565,17 @@ export class DevEcoProxy {
       "accept-language": "zh-CN",
     }
 
-    // DevEco rejects the OpenAI object form of tool_choice; rewrite it before
-    // anything else. The vision fallback below may then strip tools entirely.
+    // DevEco rejects the OpenAI object form of tool_choice and the "developer"
+    // message role; rewrite both before anything else. The vision fallback
+    // below may then strip tools entirely.
     let routedBody: Record<string, unknown> | null = null
     if (parsedBody) {
-      const normalized = normalizeOpenAIToolChoice(parsedBody)
-      if (normalized.changed) routedBody = normalized.body
+      let body = parsedBody
+      const roles = normalizeOpenAIDeveloperRole(body)
+      if (roles.changed) body = roles.body
+      const toolChoice = normalizeOpenAIToolChoice(body)
+      if (toolChoice.changed) body = toolChoice.body
+      if (body !== parsedBody) routedBody = body
     }
 
     // Vision fallback: a text-only model asking about an image in the newest
