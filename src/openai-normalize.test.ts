@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest"
 import {
+  normalizeOpenAIChatBody,
   normalizeOpenAIDeveloperRole,
+  normalizeOpenAIMaxTokens,
   normalizeOpenAIToolChoice,
 } from "./openai-normalize.js"
 
@@ -98,5 +100,56 @@ describe("normalizeOpenAIDeveloperRole", () => {
     const r = normalizeOpenAIDeveloperRole({ messages: [null, 7, { role: "developer", content: "x" }] })
     expect(r.changed).toBe(true)
     expect(r.body.messages).toEqual([null, 7, { role: "system", content: "x" }])
+  })
+})
+
+describe("normalizeOpenAIMaxTokens", () => {
+  it("renames max_completion_tokens to max_tokens", () => {
+    const r = normalizeOpenAIMaxTokens({ max_completion_tokens: 100_000 })
+    expect(r.changed).toBe(true)
+    expect(r.body.max_tokens).toBe(100_000)
+    expect("max_completion_tokens" in r.body).toBe(false)
+  })
+
+  it("keeps an explicit max_tokens and drops the alias", () => {
+    const r = normalizeOpenAIMaxTokens({ max_tokens: 16, max_completion_tokens: 100_000 })
+    expect(r.body.max_tokens).toBe(16)
+    expect("max_completion_tokens" in r.body).toBe(false)
+  })
+
+  it("drops a non-numeric cap instead of forwarding garbage", () => {
+    const r = normalizeOpenAIMaxTokens({ max_completion_tokens: "lots" })
+    expect(r.changed).toBe(true)
+    expect("max_tokens" in r.body).toBe(false)
+  })
+
+  it("leaves bodies without the alias untouched", () => {
+    const body = { max_tokens: 32 }
+    const r = normalizeOpenAIMaxTokens(body)
+    expect(r.changed).toBe(false)
+    expect(r.body).toBe(body)
+  })
+})
+
+describe("normalizeOpenAIChatBody", () => {
+  it("applies the role, token-cap and tool_choice quirks in one pass", () => {
+    const r = normalizeOpenAIChatBody({
+      messages: [{ role: "developer", content: "sys" }],
+      max_completion_tokens: 500,
+      tool_choice: { type: "function", function: { name: "read" } },
+      tools: [tool("read"), tool("write")],
+    })
+    expect(r.changed).toBe(true)
+    expect(r.body.messages).toEqual([{ role: "system", content: "sys" }])
+    expect(r.body.max_tokens).toBe(500)
+    expect(r.body.tool_choice).toBe("required")
+    expect(r.body.tools).toEqual([tool("read")])
+  })
+
+  it("reports a DevEco-clean body as unchanged", () => {
+    const body = { messages: [{ role: "user", content: "hi" }], max_tokens: 8 }
+    const r = normalizeOpenAIChatBody(body)
+    expect(r.changed).toBe(false)
+    expect(r.body).toBe(body)
   })
 })

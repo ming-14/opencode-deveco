@@ -10,6 +10,10 @@
 // "assistant" | "system" | "tool" are accepted. The newer OpenAI "developer"
 // role still makes the upstream reject the whole request with a Role
 // deserialisation error, so it is downgraded to "system".
+//
+// DevEco only knows the older `max_tokens`. `max_completion_tokens` is
+// ignored, which leaves the model free to generate up to its own default cap —
+// long enough for the non-streaming gateway to drop the connection.
 
 import { log } from "./config.js"
 
@@ -103,4 +107,49 @@ export function normalizeOpenAIDeveloperRole(
 
   log.debug("proxy: message role developer → system")
   return { body: { ...body, messages: rewritten }, changed: true }
+}
+
+/**
+ * Translate OpenAI's newer `max_completion_tokens` into DevEco's `max_tokens`.
+ * The upstream ignores the former, so the cap never applies: the model then
+ * runs to its own default limit and the non-streaming gateway drops the
+ * connection mid-generation. A non-numeric value is simply dropped.
+ */
+export function normalizeOpenAIMaxTokens(
+  body: Record<string, unknown>,
+): BodyNormalization {
+  const maxCompletion = body.max_completion_tokens
+  if (maxCompletion === undefined) return { body, changed: false }
+
+  const rest: Record<string, unknown> = { ...body }
+  delete rest.max_completion_tokens
+  if (typeof maxCompletion === "number" && rest.max_tokens === undefined) {
+    rest.max_tokens = maxCompletion
+  }
+  log.debug("proxy: max_completion_tokens → max_tokens", { maxCompletion })
+  return { body: rest, changed: true }
+}
+
+/**
+ * Apply every DevEco chat-completions quirk in one pass: roles first (a
+ * body-level enum), then the token cap, then tool_choice, which may narrow
+ * `tools` and therefore has to run last.
+ */
+export function normalizeOpenAIChatBody(
+  body: Record<string, unknown>,
+): BodyNormalization {
+  let current = body
+  let changed = false
+  for (const normalize of [
+    normalizeOpenAIDeveloperRole,
+    normalizeOpenAIMaxTokens,
+    normalizeOpenAIToolChoice,
+  ]) {
+    const result = normalize(current)
+    if (result.changed) {
+      current = result.body
+      changed = true
+    }
+  }
+  return { body: current, changed }
 }

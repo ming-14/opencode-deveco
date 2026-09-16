@@ -37,10 +37,7 @@ import {
   type AnthropicRequest,
 } from "./anthropic-transform.js"
 import { applyVisionRouting } from "./vision-routing.js"
-import {
-  normalizeOpenAIDeveloperRole,
-  normalizeOpenAIToolChoice,
-} from "./openai-normalize.js"
+import { normalizeOpenAIChatBody } from "./openai-normalize.js"
 
 const DEVECO_ORIGIN = new URL(DEVECO_API_BASE).origin // https://cn.devecostudio.huawei.com
 const DEVECO_API_PREFIX = new URL(DEVECO_API_BASE).pathname.replace(/\/$/, "") // /sse/codeGenie/maas/v2
@@ -184,7 +181,17 @@ export class DevEcoProxy {
       /* ignore */
     })
 
-    this.server = http.createServer((req, res) => this.handle(req, res))
+    // Last line of defence: a request must never be able to reject its way out
+    // of the server callback — an unhandled rejection exits the process, and
+    // the whole point of this proxy is to keep the client connected across
+    // upstream failures.
+    this.server = http.createServer((req, res) => {
+      this.handle(req, res).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        log.error("proxy request failed", { error: msg })
+        this.json(res, 500, { error: msg })
+      })
+    })
     await new Promise<void>((resolve, reject) => {
       this.server!.on("error", reject)
       this.server!.listen(this.port, this.hostname, () => resolve())
@@ -486,11 +493,13 @@ export class DevEcoProxy {
       }
 
       if (p === "/chat/completions" && req.method === "POST") {
-        return this.forwardChat(req, res)
+        // Awaited: an upstream failure rejects this promise, and returning it
+        // bare would skip the catch below and kill the process instead.
+        return await this.forwardChat(req, res)
       }
 
       if (p === "/anthropic/v1/messages" && req.method === "POST") {
-        return this.forwardAnthropic(req, res)
+        return await this.forwardAnthropic(req, res)
       }
 
       return this.json(res, 404, { error: `not found: ${url.pathname}` })
@@ -565,17 +574,14 @@ export class DevEcoProxy {
       "accept-language": "zh-CN",
     }
 
-    // DevEco rejects the OpenAI object form of tool_choice and the "developer"
-    // message role; rewrite both before anything else. The vision fallback
-    // below may then strip tools entirely.
+    // DevEco rejects several OpenAI-side shapes (the "developer" role, the
+    // tool_choice object form) and ignores max_completion_tokens; rewrite them
+    // all before anything else. The vision fallback below may then strip tools
+    // entirely.
     let routedBody: Record<string, unknown> | null = null
     if (parsedBody) {
-      let body = parsedBody
-      const roles = normalizeOpenAIDeveloperRole(body)
-      if (roles.changed) body = roles.body
-      const toolChoice = normalizeOpenAIToolChoice(body)
-      if (toolChoice.changed) body = toolChoice.body
-      if (body !== parsedBody) routedBody = body
+      const normalized = normalizeOpenAIChatBody(parsedBody)
+      if (normalized.changed) routedBody = normalized.body
     }
 
     // Vision fallback: a text-only model asking about an image in the newest

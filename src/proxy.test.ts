@@ -364,4 +364,34 @@ describe("DevEcoProxy integration", () => {
     )
     expect(logged).toBe(true)
   })
+
+  it("answers 500 instead of exiting when the upstream fetch fails", async () => {
+    const fresh = makeJwt({ userId: "u1", userName: "New", exp: Math.floor(Date.now() / 1000) + 3600 })
+    await new JsonTokenStore().save(fresh)
+    const p = await startProxy()
+
+    // The upstream drops the connection before sending anything (DevEco resets
+    // it when a request runs past its gateway limit). That rejection used to
+    // escape handle() and kill the process as an unhandled rejection.
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes("127.0.0.1")) return originalFetch(input, init)
+      if (url.includes("jwToken/check") || url.includes("exitSessionQueue")) {
+        return mockUpstreamFetch(input, init)
+      }
+      throw new TypeError("fetch failed")
+    }) as typeof fetch
+
+    const res = await fetch(`http://127.0.0.1:${p.getPort()}/v2/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "GLM-5.1", messages: [{ role: "user", content: "hi" }] }),
+    })
+    expect(res.status).toBe(500)
+    expect(String((await res.json()).error)).toContain("upstream fetch failed")
+
+    // Still serving: the next request must not find a dead process.
+    const status = await (await fetch(`http://127.0.0.1:${p.getPort()}/v2/status`)).json()
+    expect(status.logged_in).toBe(true)
+  })
 })
