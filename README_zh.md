@@ -255,6 +255,25 @@ DevEco 对短时间新建会话数量有限制（`UserSessionLimitExceeded`）�
 
 ---
 
+## 上下文长度实测（2026-09-17）
+
+用 **needle-in-haystack** 探针实测各模型真实可用的上下文：把随机暗号埋在长文约 30% 处、要求原样回读，并以响应里的 `usage.prompt_tokens`（上游真实计数）为准，从约 2.5K tokens 起逐级放大：
+
+| 模型 | 上游声明 `context_window` | 实测通过 | 实测被拒 | 结论 |
+|---|---|---|---|---|
+| `deepseek-v4-flash` | 未声明（不在模型表中） | 1,042,769 tokens（约 85 s） | 1,044,994 → `400 OverLimitRequestBody` | 硬上限 **1,044,480** tokens（≈1020K） |
+| `GLM-5.3` | 170,000 | 198,197 tokens（116 s） | 209,880 → `403 ModelServiceError` | 有效 **≈200K** |
+| `GLM-5.1` | 170,000 | 198,192 tokens（49 s） | 204,110 → `403 ModelServiceError` | 有效 **≈200K** |
+
+- **`deepseek-v4-flash` 是明确的硬限制**，上游报错会直接给出数字：`the prompt length 1044994 must less than the maximum input length 1044480`。超限即 `400`，边界干净。
+- **GLM-5.x 的拒绝不是长度报错**，而是 `403 ModelServiceError`：`Built-in model service is currently overloaded` / `Full inference timed out`（约 35 s 快速拒绝，不是真的跑满超时）。198K 稳定通过、204K 起稳定被拒，所以 ≈200K 是**观测量**而不是上游声明的限制；实际使用建议留余量（GLM-5.1 按 ~190K、GLM-5.3 按 ~180K 更稳，后者在 198K 时单次要 116 s）。
+- 同一段文本 GLM 的分词更省（约 1.17 tokens/词 vs deepseek 的 1.23），但可用容量仍差一个数量级。
+- **`deepseek-v4-flash` 是隐藏模型**：既不在 `GET /v2/models`，也不在上游 `modelConfig` 里（后者只有 `GLM-5.3` / `GLM-5.1` / `Qwen3_VL_235B_A22B_Instruct`）。靠模型列表自动拉取的客户端看不到它，必须手写模型名。
+- 压测期间代理**未崩溃**：单请求 body 约 4 MB、连续 50+ 次调用都拿到正常 HTTP 响应；唯一一次 5xx 是并行发两个大请求时上游断连（`upstream fetch failed`），代理返回 `500` 后继续服务。
+- 复现方法：以 `usage.prompt_tokens` 为准从 2K 起按约 1.25 倍递增，直到被拒；把暗号挪到接近结尾（如 90% 处）可额外验证尾部是否被完整读取。
+
+---
+
 ## Claude Code 集成
 
 代理同时支持 **Anthropic Messages API**（`POST /anthropic/v1/messages`），自动将请求转换为 OpenAI Chat Completions 格式。这让 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 可以直接使用 DevEco 模型。

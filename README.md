@@ -244,6 +244,44 @@ opencode run "say hi" -m deveco/GLM-5.1 # real request through the proxy
 
 ---
 
+## Measured context limits (2026-09-17)
+
+Measured with a **needle-in-haystack** probe: a random code buried ~30% into a
+long filler prompt and asked back verbatim. `usage.prompt_tokens` from the
+response is the authoritative upstream count; sizes start at ~2.5K tokens and
+grow ~1.25× per step.
+
+| Model | Declared `context_window` | Measured pass | Measured reject | Verdict |
+|---|---|---|---|---|
+| `deepseek-v4-flash` | not declared (absent from the model list) | 1,042,769 tokens (~85 s) | 1,044,994 → `400 OverLimitRequestBody` | hard cap **1,044,480** tokens (≈1020K) |
+| `GLM-5.3` | 170,000 | 198,197 tokens (116 s) | 209,880 → `403 ModelServiceError` | effective **≈200K** |
+| `GLM-5.1` | 170,000 | 198,192 tokens (49 s) | 204,110 → `403 ModelServiceError` | effective **≈200K** |
+
+- **`deepseek-v4-flash` enforces a hard cap** and names it in the error:
+  `the prompt length 1044994 must less than the maximum input length 1044480`.
+  Crossing the line is a plain `400`, so the boundary is crisp.
+- **GLM-5.x reports no length error.** It answers `403 ModelServiceError`
+  (`Built-in model service is currently overloaded` / `Full inference timed
+  out`) after ~35 s — a fast rejection, not a genuine timeout. 198K passes
+  consistently, 204K and above fails consistently, so ≈200K is an **observed**
+  ceiling rather than a declared one. Leave headroom in practice (~190K for
+  GLM-5.1, ~180K for GLM-5.3 — the latter already takes 116 s at 198K).
+- GLM tokenizes the same text more cheaply (~1.17 tokens/word vs deepseek's
+  1.23), yet its usable window is an order of magnitude smaller.
+- **`deepseek-v4-flash` is a hidden model**: it appears neither in
+  `GET /v2/models` nor in the upstream `modelConfig` (which only lists
+  `GLM-5.3` / `GLM-5.1` / `Qwen3_VL_235B_A22B_Instruct`). Clients that build
+  their model list dynamically will not see it — pin the model name by hand.
+- **The proxy did not crash under this load**: 50+ calls with single request
+  bodies of ~4 MB all returned normal HTTP responses; the only 5xx came from an
+  upstream disconnect while two huge requests ran in parallel
+  (`upstream fetch failed`), and the proxy answered `500` and kept serving.
+- To reproduce: trust `usage.prompt_tokens`, start at 2K and grow ~1.25× per
+  step until rejected; moving the needle toward the end (~90%) additionally
+  checks that the tail is read in full.
+
+---
+
 ## Claude Code integration
 
 The proxy also speaks the **Anthropic Messages API** (`POST /anthropic/v1/messages`),
