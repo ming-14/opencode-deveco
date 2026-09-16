@@ -392,14 +392,20 @@ behind each.
 - **Client disconnects release the upstream** — a dropped SSE/HTTP client
   cancels the upstream read loop instead of draining the backend connection
   into a dead pipe, and a client that leaves while its request is still queued
-  starts no upstream turn at all; graceful shutdown no longer hangs on
-  long-lived streams (5s grace, then force-close).
+  is dropped from the queue (no upstream turn at all, and no cooldown charged to
+  the requests behind it); graceful shutdown no longer hangs on long-lived
+  streams (5s grace, then force-close).
 - **Queued requests can cool down** — `DEVECO_QUEUE_COOLDOWN_SEC` (default `1`,
   fractions allowed; `0` switches it off) pauses that many seconds before a
   request that had to queue is admitted, so burst-adjacent turns don't hit the
   backend back-to-back. A request that finds a free slot still starts
   immediately, and the cooling slot stays reserved for the waiter so a
   latecomer can't take it.
+- **Turns hand over cleanly** — a finished turn's slot is passed to the next
+  queued turn only once DevEco confirms the server-side queue slot is released
+  (`exitSessionQueue`), capped at 3s so a wedged release call can't stall the
+  queue. Metadata endpoints (`/v2/status`, `/v2/models`, `/v2/login`,
+  `/v2/logout`) never queue at all: they are reads, not generations.
 - **Bounded request bodies** (128 MB) and `POST`-only chat forwarding.
 - **Non-blocking login** — `/v2/login` redirects immediately, and requests made
   while logged out fail fast with the login URL instead of hanging.

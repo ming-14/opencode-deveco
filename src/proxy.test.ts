@@ -321,6 +321,54 @@ describe("ConcurrencyGate", () => {
     expect(order).toEqual(["first", "latecomer"])
     gate.release()
   })
+
+  // --- cancellable waiters ---------------------------------------------------
+
+  it("refuses a slot to a caller that was already gone", async () => {
+    const gate = new ConcurrencyGate(1)
+    await gate.acquire("holder")
+    const ctrl = new AbortController()
+    ctrl.abort()
+    // Never enters the queue, so waiting on it costs the gate nothing.
+    expect(await gate.acquire("dead", ctrl.signal)).toBe(false)
+    gate.release()
+    expect(await gate.acquire("next")).toBe(true)
+    gate.release()
+  })
+
+  it("drops a queued waiter whose caller gave up instead of admitting it", async () => {
+    const gate = new ConcurrencyGate(1)
+    await gate.acquire("holder")
+    const ctrl = new AbortController()
+    const dead = gate.acquire("dead", ctrl.signal)
+    let liveAdmitted = false
+    const live = gate.acquire("live").then((ok: boolean) => (liveAdmitted = ok))
+    ctrl.abort()
+    // The abandoned waiter resolves without a slot — it is not admitted first
+    // just to notice its client is gone (which is what it used to do).
+    expect(await dead).toBe(false)
+    gate.release()
+    await live
+    expect(liveAdmitted).toBe(true)
+    gate.release()
+  })
+
+  it("passes a granted slot on when the caller gives up during the cooldown", async () => {
+    const gate = new ConcurrencyGate(1, 40)
+    await gate.acquire("holder")
+    const ctrl = new AbortController()
+    const dead = gate.acquire("dead", ctrl.signal)
+    await tick()
+    gate.release() // `dead` is granted and now cooling down
+    let liveAdmitted = false
+    const live = gate.acquire("live").then((ok: boolean) => (liveAdmitted = ok))
+    ctrl.abort()
+    expect(await dead).toBe(false)
+    // The promised slot was not dropped with it: the waiter behind still gets in.
+    await live
+    expect(liveAdmitted).toBe(true)
+    gate.release()
+  })
 })
 
 describe("sessionKeyFromHeaders", () => {
@@ -881,6 +929,133 @@ describe("DevEcoProxy integration", () => {
       // above the ~0ms a missing cooldown would show.
       expect(upstreamStarts).toHaveLength(2)
       expect(upstreamStarts[1] - slotFreedAt).toBeGreaterThanOrEqual(250)
+    } finally {
+      delete process.env.DEVECO_QUEUE_COOLDOWN_SEC
+    }
+  })
+
+  it("answers /v2/models while a turn holds the only slot", async () => {
+    const fresh = makeJwt({ userId: "u1", userName: "New", exp: Math.floor(Date.now() / 1000) + 3600 })
+    await new JsonTokenStore().save(fresh)
+
+    let releaseTurn!: () => void
+    const turnHeld = new Promise<void>((resolve) => {
+      releaseTurn = resolve
+    })
+    let turnStarted = false
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes("127.0.0.1")) return originalFetch(input, init)
+      if (url.includes("jwToken/check") || url.includes("exitSessionQueue")) {
+        return mockUpstreamFetch(input, init)
+      }
+      if (url.includes("/modelConfig")) {
+        return new Response(
+          JSON.stringify({
+            code: 200,
+            body: {
+              inner_models: [
+                {
+                  model_configs: [
+                    { model_id: "GLM-5.1", thinking_mode: "on", tool_call_mode: "tool_calls" },
+                  ],
+                },
+              ],
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        )
+      }
+      // The turn occupies the only upstream slot until the test lets it go.
+      turnStarted = true
+      await turnHeld
+      return new Response(
+        JSON.stringify({
+          id: "chatcmpl-models",
+          object: "chat.completion",
+          model: "GLM-5.1",
+          choices: [
+            { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    const p = await startProxy()
+    const turn = fetch(`http://127.0.0.1:${p.getPort()}/v2/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "GLM-5.1", messages: [{ role: "user", content: "hi" }] }),
+    })
+    await vi.waitFor(() => expect(turnStarted).toBe(true), { timeout: 2000 })
+
+    // A metadata read must not queue behind the turn (it used to, which stalled
+    // the client's model picker for as long as the turn ran).
+    const res = await fetch(`http://127.0.0.1:${p.getPort()}/v2/models`)
+    expect(res.status).toBe(200)
+    const list = (await res.json()) as { data: Array<{ id: string }> }
+    expect(list.data.map((m) => m.id)).toContain("GLM-5.1")
+
+    releaseTurn()
+    expect((await turn).status).toBe(200)
+  })
+
+  it("starts the next turn only after DevEco confirms the server-side queue exit", async () => {
+    const fresh = makeJwt({ userId: "u1", userName: "New", exp: Math.floor(Date.now() / 1000) + 3600 })
+    await new JsonTokenStore().save(fresh)
+
+    const upstreamStarts: number[] = []
+    let exitFinishedAt = 0
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes("127.0.0.1")) return originalFetch(input, init)
+      if (url.includes("jwToken/check")) return mockUpstreamFetch(input, init)
+      if (url.includes("exitSessionQueue")) {
+        // A slow but successful release: the next turn has to wait for it.
+        // Only the first exit is timed — the second one belongs to the turn
+        // under test and would otherwise move the reference point.
+        await new Promise((r) => setTimeout(r, 300))
+        if (!exitFinishedAt) exitFinishedAt = Date.now()
+        return new Response("ok", { status: 200 })
+      }
+      upstreamStarts.push(Date.now())
+      // Held long enough that the second turn is guaranteed to queue behind it.
+      await new Promise((r) => setTimeout(r, 200))
+      return new Response(
+        JSON.stringify({
+          id: "chatcmpl-exit",
+          object: "chat.completion",
+          model: "GLM-5.1",
+          choices: [
+            { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    // Isolate the exit wait from the (default-on) cooldown.
+    process.env.DEVECO_QUEUE_COOLDOWN_SEC = "0"
+    try {
+      const p = await startProxy()
+      const post = () =>
+        fetch(`http://127.0.0.1:${p.getPort()}/v2/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "GLM-5.1", messages: [{ role: "user", content: "hi" }] }),
+        })
+      await Promise.all([post(), post()])
+
+      expect(upstreamStarts).toHaveLength(2)
+      expect(exitFinishedAt).toBeGreaterThan(0)
+      // Without the wait the second turn would have started ~300ms earlier,
+      // while DevEco still had the first turn's queue slot leased.
+      expect(upstreamStarts[1]).toBeGreaterThanOrEqual(exitFinishedAt)
     } finally {
       delete process.env.DEVECO_QUEUE_COOLDOWN_SEC
     }

@@ -61,6 +61,16 @@ export const DEVECO_TEXT_ONLY_MODELS = ["GLM-5.1"]
 export const UPSTREAM_IDLE_TIMEOUT_MS = 120_000
 
 /**
+ * How long a finished turn waits for DevEco to confirm its server-side queue
+ * slot release (exitSessionQueue) before the concurrency slot is handed to the
+ * next request. Waiting is the point — the next turn must not start against a
+ * slot that is still leased upstream — but a wedged release call must not stall
+ * the queue either, so the wait is capped and the retry chain finishes in the
+ * background.
+ */
+export const EXIT_QUEUE_GRACE_MS = 3_000
+
+/**
  * How many upstream requests may be in flight at once. DevEco throttles bursts
  * per account, so the default is one at a time and latecomers queue instead of
  * failing. Override with DEVECO_MAX_CONCURRENCY.

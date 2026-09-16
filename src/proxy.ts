@@ -24,6 +24,7 @@ import {
   DEVECO_DEFAULTS,
   DEVECO_BASE_URL,
   DEVECO_EXIT_QUEUE_URL,
+  EXIT_QUEUE_GRACE_MS,
   UPSTREAM_IDLE_TIMEOUT_MS,
   log,
   maxConcurrency,
@@ -90,6 +91,21 @@ export function idleBudget(idleMs: number): {
 }
 
 /**
+ * A queued request waiting for a slot. `granted` marks the moment release()
+ * promises the slot to it (the cooldown timer is what delays the hand-over).
+ */
+interface Waiter {
+  label: string
+  /** `true` = admitted (one release() owed), `false` = caller gave up, no slot. */
+  resolve: (admitted: boolean) => void
+  enqueuedAt: number
+  granted: boolean
+  timer: ReturnType<typeof setTimeout> | null
+  /** Detaches the abort listener so a late abort can't touch a granted slot. */
+  detach: () => void
+}
+
+/**
  * FIFO semaphore capping how many upstream requests run at once. DevEco
  * throttles bursts per account, so a burst degrades into a queue instead of a
  * failure; waiters are admitted in arrival order. The width comes from
@@ -104,22 +120,45 @@ export class ConcurrencyGate {
   private readonly limit: number
   private readonly cooldownMs: number
   private active = 0
-  private readonly waiters: Array<() => void> = []
+  private readonly waiters: Waiter[] = []
 
   constructor(limit: number, cooldownMs = 0) {
     this.limit = Math.max(1, Math.floor(limit))
     this.cooldownMs = Math.max(0, cooldownMs)
   }
 
-  async acquire(label: string): Promise<void> {
+  /**
+   * Take a slot, or wait for one. Resolves `true` when admitted — the caller
+   * then owes exactly one `release()` — and `false` when `signal` aborted while
+   * queued, in which case no slot was taken and nothing is owed. Without the
+   * signal an abandoned waiter was still admitted later, just to notice its
+   * client was gone, and that hand-over cost the queue another cooldown.
+   */
+  async acquire(label: string, signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) return false
     if (this.active < this.limit) {
       this.active++
-      return
+      return true
     }
-    log.debug(`proxy: queued ${label} (all ${this.limit} upstream slot(s) busy)`)
-    // The slot this waiter eventually gets is handed over by release(), which
-    // keeps it counted as active, so nothing is incremented here.
-    await new Promise<void>((resolve) => this.waiters.push(resolve))
+    log.debug(
+      `proxy: queued ${label} (all ${this.limit} upstream slot(s) busy, ${this.waiters.length} ahead)`,
+    )
+    return new Promise<boolean>((resolve) => {
+      const waiter: Waiter = {
+        label,
+        resolve,
+        enqueuedAt: Date.now(),
+        granted: false,
+        timer: null,
+        detach: () => {},
+      }
+      if (signal) {
+        const onAbort = () => this.cancel(waiter)
+        signal.addEventListener("abort", onAbort, { once: true })
+        waiter.detach = () => signal.removeEventListener("abort", onAbort)
+      }
+      this.waiters.push(waiter)
+    })
   }
 
   release(): void {
@@ -131,12 +170,44 @@ export class ConcurrencyGate {
     // The freed slot moves straight to the next waiter — still counted as
     // active, so a request arriving during the cooldown queues behind it
     // instead of stealing the slot that was already promised.
+    next.granted = true
+    const admit = () => {
+      next.timer = null
+      next.detach()
+      log.debug(
+        `proxy: admitted ${next.label} after ${Date.now() - next.enqueuedAt}ms ` +
+          `(${this.waiters.length} still queued)`,
+      )
+      next.resolve(true)
+    }
     if (this.cooldownMs > 0) {
       log.debug(`proxy: cooling down ${this.cooldownMs}ms before admitting the next queued request`)
-      setTimeout(next, this.cooldownMs)
+      next.timer = setTimeout(admit, this.cooldownMs)
     } else {
-      next()
+      admit()
     }
+  }
+
+  /**
+   * Drop a waiter whose caller gave up. Still queued: take it out of the queue,
+   * the slot count is untouched (a queued waiter was never counted). Already
+   * granted and merely cooling down: the slot is HIS, so it is passed on
+   * exactly as a release() would — never dropped on the floor.
+   */
+  private cancel(waiter: Waiter): void {
+    if (waiter.granted) {
+      if (waiter.timer) clearTimeout(waiter.timer)
+      waiter.timer = null
+      log.debug(`proxy: ${waiter.label} left during the cooldown, passing its slot on`)
+      waiter.resolve(false)
+      this.release()
+      return
+    }
+    const idx = this.waiters.indexOf(waiter)
+    if (idx >= 0) this.waiters.splice(idx, 1)
+    waiter.detach()
+    log.debug(`proxy: dropped queued ${waiter.label} (caller gone)`)
+    waiter.resolve(false)
   }
 }
 
@@ -254,9 +325,11 @@ export class DevEcoProxy {
   // Explicit GET /v2/login is never throttled.
   private lastLoginTriggeredAt = 0
   private static readonly LOGIN_TRIGGER_COOLDOWN_MS = 5 * 60_000
-  // Serialises upstream traffic: DevEco throttles bursts per account, so only
-  // DEVECO_MAX_CONCURRENCY requests run at once and the rest queue. A queued
-  // request additionally waits out DEVECO_QUEUE_COOLDOWN_SEC before it starts.
+  // Serialises generation turns: DevEco throttles bursts per account, so only
+  // DEVECO_MAX_CONCURRENCY turns run at once and the rest queue. A queued turn
+  // additionally waits out DEVECO_QUEUE_COOLDOWN_SEC before it starts. Metadata
+  // reads (/status, /models, /login…) never touch the gate — nothing about them
+  // deserves a turn's slot.
   private readonly gate = new ConcurrencyGate(maxConcurrency(), queueCooldownMs())
 
   constructor(opts: ProxyOptions = {}) {
@@ -356,45 +429,68 @@ export class DevEcoProxy {
   }
 
   /**
-   * Release the queue slot this turn held. Fire-and-forget, exactly as upstream
-   * treats it: a failure here must never surface to the client, whose answer
-   * has already been delivered.
+   * Release the server-side queue slot this turn held. Resolves once DevEco
+   * confirms the release, or after `EXIT_QUEUE_GRACE_MS` when the call wedges
+   * (the retry chain then finishes in the background) — callers await it before
+   * handing the concurrency slot to the next turn. Never rejects: this runs on
+   * the slot-release path, where a throw would leak the slot.
    */
-  private exitQueue(key: string, chatId: string, model: string, token: string): void {
-    const url = `${DEVECO_EXIT_QUEUE_URL}?modelId=${encodeURIComponent(model)}`
-    const attempt = (retriesLeft: number): void => {
-      fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Session-Id": key,
-          "Chat-Id": chatId,
-          Authorization: `Bearer ${token}`,
-        },
-        signal: AbortSignal.timeout(5_000),
-      })
-        .then((r) => {
+  private exitQueue(key: string, chatId: string, model: string, token: string): Promise<void> {
+    // `encodeURIComponent` throws on a lone surrogate, and the model name is
+    // client-supplied: an exit we cannot address must not blow up the release.
+    let url = DEVECO_EXIT_QUEUE_URL
+    try {
+      url = `${DEVECO_EXIT_QUEUE_URL}?modelId=${encodeURIComponent(model)}`
+    } catch {
+      log.warn("exitSessionQueue: unencodable model name, releasing without modelId")
+    }
+    const attempt = async (retriesLeft: number): Promise<void> => {
+      try {
+        const r = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Session-Id": key,
+            "Chat-Id": chatId,
+            Authorization: `Bearer ${token}`,
+          },
+          signal: AbortSignal.timeout(5_000),
+        })
+        if (r.ok) {
           // Silent when it works; a slot we failed to release is worth seeing,
           // since the symptom (errors after many turns) is otherwise baffling.
-          if (r.ok) {
-            log.debug(`exitSessionQueue -> ${r.status}`)
-          } else if (retriesLeft > 0) {
-            log.warn(`exitSessionQueue -> HTTP ${r.status}, retrying`)
-            setTimeout(() => attempt(retriesLeft - 1), 500)
-          } else {
-            log.warn(`exitSessionQueue -> HTTP ${r.status}`)
-          }
-        })
-        .catch((err) => {
-          if (retriesLeft > 0) {
-            log.warn("exitSessionQueue failed, retrying", { error: String(err) })
-            setTimeout(() => attempt(retriesLeft - 1), 500)
-          } else {
-            log.warn("exitSessionQueue failed", { error: String(err) })
-          }
-        })
+          log.debug(`exitSessionQueue -> ${r.status}`)
+          return
+        }
+        if (retriesLeft <= 0) {
+          log.warn(`exitSessionQueue -> HTTP ${r.status}`)
+          return
+        }
+        log.warn(`exitSessionQueue -> HTTP ${r.status}, retrying`)
+      } catch (err) {
+        if (retriesLeft <= 0) {
+          log.warn("exitSessionQueue failed", { error: String(err) })
+          return
+        }
+        log.warn("exitSessionQueue failed, retrying", { error: String(err) })
+      }
+      await new Promise((r) => setTimeout(r, 500))
+      return attempt(retriesLeft - 1)
     }
-    attempt(1) // one initial attempt + one retry
+
+    return new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(grace)
+        resolve()
+      }
+      const grace = setTimeout(() => {
+        log.warn(
+          `exitSessionQueue unresolved after ${EXIT_QUEUE_GRACE_MS}ms; letting the next turn through`,
+        )
+        resolve()
+      }, EXIT_QUEUE_GRACE_MS)
+      void attempt(1).then(finish, finish) // one initial attempt + one retry
+    })
   }
 
   // ---------------------------------------------------------------------------
@@ -584,24 +680,14 @@ export class DevEcoProxy {
       }
 
       if (p === "/models") {
-        // Listing models must not pop a browser: use the current session when
-        // available and fall back to the static defaults when logged out.
-        // Same guard as the turn paths: a client that left while queued should
-        // not cost an upstream call.
-        const clientGone = abortOnClientClose(res)
-        await this.gate.acquire("models")
-        try {
-          if (clientGone.signal.aborted) {
-            log.debug("proxy: client gone while queued, skipping model list")
-            return
-          }
-          const token = await this.ensureToken(false)
-          const cfg = await getDevecoProviderConfig(token)
-          const data = Object.keys(cfg.models ?? {}).map((id) => ({ id, object: "model" }))
-          return this.json(res, 200, { object: "list", data })
-        } finally {
-          this.gate.release()
-        }
+        // A metadata read, never queued: making it wait behind a streaming turn
+        // would stall the client's model picker for as long as the turn runs.
+        // It must not pop a browser either — use the current session when
+        // available, fall back to the static defaults when logged out.
+        const token = await this.ensureToken(false)
+        const cfg = await getDevecoProviderConfig(token)
+        const data = Object.keys(cfg.models ?? {}).map((id) => ({ id, object: "model" }))
+        return this.json(res, 200, { object: "list", data })
       }
 
       if (p === "/chat/completions" && req.method === "POST") {
@@ -725,12 +811,17 @@ export class DevEcoProxy {
     }
 
     // Wait for an upstream slot first: the logged duration then measures the
-    // upstream exchange, and the log order matches what the backend saw.
-    await this.gate.acquire(`chat ${model}`)
-    if (clientGone.signal.aborted) {
-      // The client left while queued. Nothing reached upstream, so there is no
-      // server-side queue slot to exit — just hand ours to the next waiter.
+    // upstream exchange, and the log order matches what the backend saw. The
+    // signal makes the wait cancellable, so a client that leaves while queued is
+    // dropped (no slot, no upstream call, no cooldown charged to those behind).
+    const admitted = await this.gate.acquire(`chat ${model}`, clientGone.signal)
+    if (!admitted) {
       log.debug("proxy: client gone while queued, skipping chat turn", { model })
+      return
+    }
+    if (clientGone.signal.aborted) {
+      // Hung up between admission and here: hand the slot straight back.
+      log.debug("proxy: client gone right after admission, skipping chat turn", { model })
       this.gate.release()
       return
     }
@@ -783,9 +874,9 @@ export class DevEcoProxy {
       await this.pipeResponse(responseToPipe, res, stream, { ...ctx, clientGone: signal }, budget.touch)
     } finally {
       budget.done()
-      this.exitQueue(convKey, chatId, upstreamModel, accessToken)
-      // Released last: the next queued request must not start while this one
-      // is still streaming.
+      // Hand the slot over only once DevEco confirms its queue slot is gone
+      // (bounded inside exitQueue), and only after this turn stopped streaming.
+      await this.exitQueue(convKey, chatId, upstreamModel, accessToken)
       this.gate.release()
     }
   }
@@ -853,13 +944,18 @@ export class DevEcoProxy {
       "accept-language": "zh-CN",
     }
 
-    // Wait for an upstream slot first: the logged duration then measures the
-    // upstream exchange, and the log order matches what the backend saw.
-    await this.gate.acquire(`anthropic ${model}`)
-    if (clientGone.signal.aborted) {
-      // Same as the OpenAI path: nothing reached upstream, so there is no
-      // server-side queue slot to exit — hand ours to the next waiter.
+    // Same cancellable wait as the OpenAI path, and the same teardown: the slot
+    // goes to the next turn only after exitQueue settles. Callers that still owe
+    // the client a response fire it without awaiting — the release happens
+    // either way.
+    const admitted = await this.gate.acquire(`anthropic ${model}`, clientGone.signal)
+    if (!admitted) {
       log.debug("proxy: client gone while queued, skipping anthropic turn", { model })
+      return
+    }
+    if (clientGone.signal.aborted) {
+      // Hung up between admission and here: hand the slot straight back.
+      log.debug("proxy: client gone right after admission, skipping anthropic turn", { model })
       this.gate.release()
       return
     }
@@ -871,9 +967,9 @@ export class DevEcoProxy {
 
     const budget = idleBudget(UPSTREAM_IDLE_TIMEOUT_MS)
     const signal = AbortSignal.any([budget.signal, clientGone.signal])
-    const finishTurn = () => {
+    const finishTurn = async (): Promise<void> => {
       budget.done()
-      this.exitQueue(convKey, chatId, upstreamModel, accessToken)
+      await this.exitQueue(convKey, chatId, upstreamModel, accessToken)
       this.gate.release()
     }
 
@@ -910,7 +1006,7 @@ export class DevEcoProxy {
         }
       }
     } catch (err) {
-      finishTurn()
+      void finishTurn()
       const msg = err instanceof Error ? err.message : String(err)
       log.error("anthropic upstream fetch failed", { error: msg })
       return this.json(res, 502, {
@@ -920,7 +1016,7 @@ export class DevEcoProxy {
     }
 
     if (!upstream.ok) {
-      finishTurn()
+      void finishTurn()
       const errText = await upstream.text().catch(() => "")
       log.error(`anthropic upstream error: HTTP ${upstream.status}`, { body: errText.slice(0, 200) })
       return this.json(res, upstream.status, {
@@ -931,7 +1027,7 @@ export class DevEcoProxy {
 
     if (isStream) {
       if (!upstream.body) {
-        finishTurn()
+        void finishTurn()
         return this.json(res, 502, {
           type: "error",
           error: { type: "api_error", message: "Upstream returned no body for stream" },
@@ -970,17 +1066,22 @@ export class DevEcoProxy {
       return
     }
 
-    // Non-streaming
-    finishTurn()
-    const openaiResponse = await upstream.json()
-    const anthropicResponse = openaiChatToAnthropic(openaiResponse, model)
-    const dur = Date.now() - t0
-    const usage = anthropicResponse.usage
-    log.info(
-      `<- 200 ${dur}ms anthropic/no-stream in=${usage.input_tokens} out=${usage.output_tokens} model=${model}`,
-    )
-    res.writeHead(200, { "Content-Type": "application/json" })
-    res.end(JSON.stringify(anthropicResponse))
+    // Non-streaming. The slot is released only after the body has been read and
+    // answered — same as the OpenAI path — so "serial" covers the whole upstream
+    // exchange, not just its response head.
+    try {
+      const openaiResponse = await upstream.json()
+      const anthropicResponse = openaiChatToAnthropic(openaiResponse, model)
+      const dur = Date.now() - t0
+      const usage = anthropicResponse.usage
+      log.info(
+        `<- 200 ${dur}ms anthropic/no-stream in=${usage.input_tokens} out=${usage.output_tokens} model=${model}`,
+      )
+      res.writeHead(200, { "Content-Type": "application/json" })
+      res.end(JSON.stringify(anthropicResponse))
+    } finally {
+      await finishTurn()
+    }
   }
 
   private async pipeResponse(
