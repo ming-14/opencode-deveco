@@ -3,6 +3,7 @@ import {
   normalizeOpenAIChatBody,
   normalizeOpenAIDeveloperRole,
   normalizeOpenAIMaxTokens,
+  normalizeOpenAIReasoningEffort,
   normalizeOpenAIToolChoice,
 } from "./openai-normalize.js"
 
@@ -131,6 +132,48 @@ describe("normalizeOpenAIMaxTokens", () => {
   })
 })
 
+describe("normalizeOpenAIReasoningEffort", () => {
+  it("maps none/off to thinking disabled and drops the effort", () => {
+    for (const effort of ["none", "off"]) {
+      const r = normalizeOpenAIReasoningEffort({ reasoning_effort: effort })
+      expect(r.changed).toBe(true)
+      expect("reasoning_effort" in r.body).toBe(false)
+      expect(r.body.thinking).toEqual({ type: "disabled" })
+    }
+  })
+
+  it("tolerates case and surrounding whitespace", () => {
+    for (const effort of ["None", " OFF "]) {
+      const r = normalizeOpenAIReasoningEffort({ reasoning_effort: effort })
+      expect(r.changed).toBe(true)
+      expect(r.body.thinking).toEqual({ type: "disabled" })
+    }
+  })
+
+  it("overrides an explicit thinking field", () => {
+    const r = normalizeOpenAIReasoningEffort({
+      reasoning_effort: "none",
+      thinking: { type: "enabled" },
+    })
+    expect(r.body.thinking).toEqual({ type: "disabled" })
+  })
+
+  it("forwards DevEco's enum values untouched", () => {
+    for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
+      const body = { reasoning_effort: effort }
+      const r = normalizeOpenAIReasoningEffort(body)
+      expect(r.changed).toBe(false)
+      expect(r.body).toBe(body)
+    }
+  })
+
+  it("leaves unknown values for the upstream validator", () => {
+    const body = { reasoning_effort: "minimal" }
+    expect(normalizeOpenAIReasoningEffort(body).changed).toBe(false)
+    expect(normalizeOpenAIReasoningEffort({}).changed).toBe(false)
+  })
+})
+
 describe("normalizeOpenAIChatBody", () => {
   it("applies the role, token-cap and tool_choice quirks in one pass", () => {
     const r = normalizeOpenAIChatBody({
@@ -144,6 +187,16 @@ describe("normalizeOpenAIChatBody", () => {
     expect(r.body.max_tokens).toBe(500)
     expect(r.body.tool_choice).toBe("required")
     expect(r.body.tools).toEqual([tool("read")])
+  })
+
+  it("maps reasoning_effort off/none inside the combined pass", () => {
+    const r = normalizeOpenAIChatBody({
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "off",
+    })
+    expect(r.changed).toBe(true)
+    expect("reasoning_effort" in r.body).toBe(false)
+    expect(r.body.thinking).toEqual({ type: "disabled" })
   })
 
   it("reports a DevEco-clean body as unchanged", () => {

@@ -131,6 +131,28 @@ export function normalizeOpenAIMaxTokens(
 }
 
 /**
+ * OpenAI clients spell "no reasoning" as reasoning_effort:"none" (some tools
+ * send "off"). DevEco's enum only knows low|medium|high|xhigh|max and rejects
+ * the whole request otherwise; the equivalent switch upstream is
+ * thinking:{type:"disabled"}. Unrecognised values are left to the upstream
+ * validator so a genuinely bogus effort still surfaces as a 400.
+ */
+export function normalizeOpenAIReasoningEffort(
+  body: Record<string, unknown>,
+): BodyNormalization {
+  const effort = body.reasoning_effort
+  if (typeof effort !== "string") return { body, changed: false }
+  const value = effort.trim().toLowerCase()
+  if (value !== "none" && value !== "off") return { body, changed: false }
+
+  const rest: Record<string, unknown> = { ...body }
+  delete rest.reasoning_effort
+  rest.thinking = { type: "disabled" }
+  log.debug("proxy: reasoning_effort none/off → thinking disabled", { effort })
+  return { body: rest, changed: true }
+}
+
+/**
  * Apply every DevEco chat-completions quirk in one pass: roles first (a
  * body-level enum), then the token cap, then tool_choice, which may narrow
  * `tools` and therefore has to run last.
@@ -143,6 +165,7 @@ export function normalizeOpenAIChatBody(
   for (const normalize of [
     normalizeOpenAIDeveloperRole,
     normalizeOpenAIMaxTokens,
+    normalizeOpenAIReasoningEffort,
     normalizeOpenAIToolChoice,
   ]) {
     const result = normalize(current)
