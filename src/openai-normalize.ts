@@ -14,6 +14,10 @@
 // DevEco only knows the older `max_tokens`. `max_completion_tokens` is
 // ignored, which leaves the model free to generate up to its own default cap —
 // long enough for the non-streaming gateway to drop the connection.
+//
+// DevEco splits the model's chain of thought out of the answer only when the
+// request asks for thinking; otherwise the reasoning is emitted as ordinary
+// `content` and every client renders it as the reply.
 
 import { log } from "./config.js"
 
@@ -153,9 +157,29 @@ export function normalizeOpenAIReasoningEffort(
 }
 
 /**
+ * DevEco only routes the model's chain of thought into `reasoning_content`
+ * when the request asks for thinking. Without the switch the gateway emits the
+ * same reasoning inside `content`, where a client cannot tell it apart from the
+ * answer — it shows up as the reply. So thinking is requested by default.
+ *
+ * A client that wants it off still gets its way: an explicit `thinking` field
+ * is left alone, and `reasoning_effort:none/off` has already been turned into
+ * `thinking:{type:"disabled"}` by normalizeOpenAIReasoningEffort above.
+ */
+export function normalizeOpenAIThinking(
+  body: Record<string, unknown>,
+): BodyNormalization {
+  const existing = body.thinking
+  if (existing && typeof existing === "object") return { body, changed: false }
+  log.debug("proxy: thinking enabled by default")
+  return { body: { ...body, thinking: { type: "enabled" } }, changed: true }
+}
+
+/**
  * Apply every DevEco chat-completions quirk in one pass: roles first (a
- * body-level enum), then the token cap, then tool_choice, which may narrow
- * `tools` and therefore has to run last.
+ * body-level enum), then the token cap, then reasoning (the off switch writes
+ * `thinking`, which the default-on step must not undo), then tool_choice, which
+ * may narrow `tools` and therefore has to run last.
  */
 export function normalizeOpenAIChatBody(
   body: Record<string, unknown>,
@@ -166,6 +190,7 @@ export function normalizeOpenAIChatBody(
     normalizeOpenAIDeveloperRole,
     normalizeOpenAIMaxTokens,
     normalizeOpenAIReasoningEffort,
+    normalizeOpenAIThinking,
     normalizeOpenAIToolChoice,
   ]) {
     const result = normalize(current)

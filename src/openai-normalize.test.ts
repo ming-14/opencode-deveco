@@ -4,6 +4,7 @@ import {
   normalizeOpenAIDeveloperRole,
   normalizeOpenAIMaxTokens,
   normalizeOpenAIReasoningEffort,
+  normalizeOpenAIThinking,
   normalizeOpenAIToolChoice,
 } from "./openai-normalize.js"
 
@@ -174,7 +175,60 @@ describe("normalizeOpenAIReasoningEffort", () => {
   })
 })
 
+describe("normalizeOpenAIThinking", () => {
+  it("asks for thinking when the client expressed no preference", () => {
+    const body = { model: "GLM-5.1", messages: [{ role: "user", content: "hi" }] }
+    const r = normalizeOpenAIThinking(body)
+    expect(r.changed).toBe(true)
+    expect(r.body.thinking).toEqual({ type: "enabled" })
+    expect("thinking" in body).toBe(false)
+  })
+
+  it("keeps an explicit thinking field, enabled or disabled", () => {
+    for (const type of ["enabled", "disabled"]) {
+      const body = { thinking: { type } }
+      const r = normalizeOpenAIThinking(body)
+      expect(r.changed).toBe(false)
+      expect(r.body).toBe(body)
+    }
+  })
+
+  it("replaces a non-object thinking value the upstream would reject", () => {
+    for (const value of [null, "enabled", 3]) {
+      const r = normalizeOpenAIThinking({ thinking: value })
+      expect(r.changed).toBe(true)
+      expect(r.body.thinking).toEqual({ type: "enabled" })
+    }
+  })
+})
+
 describe("normalizeOpenAIChatBody", () => {
+  it("enables thinking when nothing in the body asks for a reasoning mode", () => {
+    const r = normalizeOpenAIChatBody({
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 8,
+    })
+    expect(r.changed).toBe(true)
+    expect(r.body.thinking).toEqual({ type: "enabled" })
+  })
+
+  it("keeps thinking enabled alongside a real reasoning_effort", () => {
+    const r = normalizeOpenAIChatBody({
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "max",
+    })
+    expect(r.body.reasoning_effort).toBe("max")
+    expect(r.body.thinking).toEqual({ type: "enabled" })
+  })
+
+  it("does not override a client that asked for thinking off", () => {
+    const r = normalizeOpenAIChatBody({
+      messages: [{ role: "user", content: "hi" }],
+      thinking: { type: "disabled" },
+    })
+    expect(r.body.thinking).toEqual({ type: "disabled" })
+  })
+
   it("applies the role, token-cap and tool_choice quirks in one pass", () => {
     const r = normalizeOpenAIChatBody({
       messages: [{ role: "developer", content: "sys" }],
@@ -197,12 +251,5 @@ describe("normalizeOpenAIChatBody", () => {
     expect(r.changed).toBe(true)
     expect("reasoning_effort" in r.body).toBe(false)
     expect(r.body.thinking).toEqual({ type: "disabled" })
-  })
-
-  it("reports a DevEco-clean body as unchanged", () => {
-    const body = { messages: [{ role: "user", content: "hi" }], max_tokens: 8 }
-    const r = normalizeOpenAIChatBody(body)
-    expect(r.changed).toBe(false)
-    expect(r.body).toBe(body)
   })
 })
